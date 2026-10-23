@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "notes": [
+    {
+      "title": "研究问题（待填写模板）",
+      "page_start": 1,
+      "page_end": 1,
+      "kind": "guide",
+      "content": "这是一条通用占位模板，不是当前论文的解读。请依据原文填写，并将关联页码改为实际 PDF 文件页码。\n\n### 研究问题\n\n- 研究对象：待填写。\n- 核心问题：待填写。\n- 系统假设：待填写。\n- 决策变量：待填写。\n- 优化目标与约束：待填写。\n- 原文证据：待填写章节、公式或图表编号。",
+      "sort_order": 0,
+      "completed": false
+    },
+    {
+      "title": "公式排版（非论文结论）",
+      "page_start": 1,
+      "page_end": 1,
+      "kind": "concept",
+      "content": "以下仅为数学排版示例，不代表任何论文的模型或结论。\n\n行内公式：$y = ax + b$。\n\n独立公式：\n\n$$\nS = \\sum_{i=1}^{n} x_i\n$$\n\n实际解析中，请说明符号、单位、假设，以及公式是原式、等价改写还是教学简化。",
+      "sort_order": 1,
+      "completed": false
+    }
+  ]
+}
