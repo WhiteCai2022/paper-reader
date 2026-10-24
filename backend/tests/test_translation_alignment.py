@@ -14,6 +14,15 @@ def marked(text, prefix="译文"):
     return "\n\n".join(f"<!-- source:{item['id']} -->\n\n{prefix} {index + 1}" for index, item in enumerate(source_blocks(text)))
 
 
+def seed_legacy_cache(translator, paper, content):
+    text, digest = translator.source_page(paper["id"], 1)
+    with translator.store.connection() as connection:
+        connection.execute(
+            "INSERT INTO translation_pages(paper_id,page,source_hash,source_text,content,model,reasoning_effort,input_tokens,output_tokens,cost_cny) VALUES (?,?,?,?,?,'deepseek-flash','none',0,0,0)",
+            (paper["id"], 1, digest, text, content),
+        )
+
+
 def test_stable_source_blocks_cover_entire_text():
     blocks = source_blocks(SOURCE)
     assert blocks == source_blocks(SOURCE)
@@ -113,8 +122,7 @@ def test_page_api_segments_and_export_strip_internal_markers(translation_client,
 def test_legacy_reading_is_free_and_page_level_only(translation_client):
     client, translator = translation_client
     paper = upload(client)
-    translator.call_provider = lambda *args: response("## 已有译文\n\n正文")
-    wait(client, start(client, paper, estimate(client, paper)).json()["id"])
+    seed_legacy_cache(translator, paper, "## 已有译文\n\n正文")
     translator.call_provider = lambda *args: pytest.fail("Reading/hover must never call the provider")
     before = translator.settings()["spent_cny"]
     result = client.get(f"/api/papers/{paper['id']}/translations/pages/1").json()
@@ -128,8 +136,7 @@ def test_legacy_reading_is_free_and_page_level_only(translation_client):
 def test_explicit_refresh_is_budgeted_keeps_old_until_success_and_never_retries(translation_client, failure):
     client, translator = translation_client
     paper = upload(client)
-    translator.call_provider = lambda *args: response("旧译文")
-    wait(client, start(client, paper, estimate(client, paper)).json()["id"])
+    seed_legacy_cache(translator, paper, "旧译文")
     calls = []
 
     def provider(*args):
@@ -162,6 +169,33 @@ def test_refresh_flag_is_strict_boolean(translation_client):
     client, _ = translation_client
     paper = upload(client)
     assert client.post(f"/api/papers/{paper['id']}/translations/estimate", json={"pages": [1], "refresh_cache": "true"}).status_code == 422
+
+
+@pytest.mark.parametrize("failure", ["unmarked", "missing", "unknown", "empty", "order", "legacy"])
+def test_first_translation_requires_complete_ordered_anchors(translation_client, monkeypatch, failure):
+    client, translator = translation_client
+    paper = upload(client)
+    monkeypatch.setattr(translator, "source_page", lambda *_: (SOURCE, "fixed-hash"))
+    blocks = source_blocks(SOURCE)
+    content = marked(SOURCE)
+    if failure == "unmarked":
+        content = "这是一段没有原文锚点的译文。"
+    elif failure == "missing":
+        content = content.replace(f"<!-- source:{blocks[0]['id']} -->", "")
+    elif failure == "unknown":
+        content += "\n<!-- source:unknown -->\n不可靠的段落"
+    elif failure == "empty":
+        content = content.replace("译文 1", "")
+    elif failure == "legacy":
+        content = "\n\n".join(f"<!-- source:{block['id']} -->\n旧版分块" for block in legacy_source_blocks(SOURCE))
+    else:
+        content = content.replace(blocks[0]["id"], "TEMP").replace(blocks[1]["id"], blocks[0]["id"]).replace("TEMP", blocks[1]["id"])
+    calls = []
+    translator.call_provider = lambda *args: calls.append(args) or response(content)
+    job = wait(client, start(client, paper, estimate(client, paper)).json()["id"])
+    assert job["status"] == "failed" and "段落锚点" in job["error"]
+    assert len(calls) == 1 and translator.cached(paper["id"], 1) is None
+    assert translator.settings()["spent_cny"] > 0 and translator.settings()["reserved_cny"] == 0
 
 
 def test_layout_or_prompt_change_invalidates_quote_before_paid_call(translation_client, monkeypatch):

@@ -63,8 +63,11 @@ def test_health_list_and_paper_crud(client):
     source = client.app.state.store.source(paper["id"])
     assert Path(source["pdf_path"]).exists()
     assert client.delete(f"/api/papers/{paper['id']}").status_code == 204
-    assert not Path(source["pdf_path"]).exists()
+    assert Path(source["pdf_path"]).exists()
     assert client.get(f"/api/papers/{paper['id']}").status_code == 404
+    assert client.get(f"/api/papers/{paper['id']}/pdf").status_code == 404
+    assert client.post(f"/api/library/trash/paper/{paper['id']}/restore").status_code == 200
+    assert client.get(f"/api/papers/{paper['id']}/pdf").content == pdf_bytes()
 
 
 def test_notes_crud_and_progress(client):

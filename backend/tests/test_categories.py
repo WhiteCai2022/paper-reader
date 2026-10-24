@@ -130,8 +130,10 @@ def test_deleting_category_keeps_pdfs_notes_and_other_memberships(client):
     assert client.delete(f"/api/papers/{first['id']}").status_code == 204
     assert counts(client)[b["id"]] == 0
     with client.app.state.store.connection() as connection:
-        assert connection.execute("SELECT COUNT(*) FROM paper_categories").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM paper_categories").fetchone()[0] == 1
         assert connection.execute("SELECT COUNT(*) FROM translation_jobs").fetchone()[0] == 0
+    assert client.post(f"/api/library/trash/paper/{first['id']}/restore").status_code == 200
+    assert counts(client)[b["id"]] == 1
 
 
 def test_categories_survive_restart_and_notes_import_does_not_change_them(tmp_path):

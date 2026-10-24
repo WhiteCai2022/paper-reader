@@ -464,8 +464,13 @@ class TranslationService:
                 api_key = self.config.api_key()
                 if not api_key:
                     raise ProviderError("API Key 已被移除，任务已停止。")
-                current_receipt = uuid.uuid4().hex
                 with self.lock, self.store.connection() as connection:
+                    current = connection.execute("SELECT status FROM translation_jobs WHERE id=?", (job_id,)).fetchone()
+                    available = connection.execute("SELECT 1 FROM papers WHERE id=? AND deleted_at IS NULL", (paper_id,)).fetchone()
+                    if self.stopping.is_set() or not current or current["status"] != "running" or not available:
+                        self.finish(job_id, "cancelled")
+                        return
+                    current_receipt = uuid.uuid4().hex
                     connection.execute("INSERT INTO translation_receipts(id,job_id,page,status,cost_cny) VALUES (?,?,?,'pending',?)", (current_receipt, job_id, page, item["upper_bound_cny"]))
                 result = self.call_provider(api_key, text, item["max_tokens"], model, reasoning_effort)
                 usage = result.get("usage", {})
@@ -477,7 +482,8 @@ class TranslationService:
                 choice = result.get("choices", [{}])[0]
                 content = choice.get("message", {}).get("content", "")
                 valid = choice.get("finish_reason") == "stop" and isinstance(content, str) and bool(content.strip())
-                alignment_failed = valid and quote.get("refresh_cache", False) and not aligned_segments(text, content)
+                segments = aligned_segments(text, content) if valid else []
+                alignment_failed = valid and (not segments or [part["id"] for part in segments] != [part["id"] for part in source_blocks(text)])
                 valid = valid and not alignment_failed
                 with self.lock, self.store.connection() as connection:
                     connection.execute("UPDATE translation_receipts SET status='success',cost_cny=?,input_tokens=?,output_tokens=? WHERE id=?", (cost, input_tokens, output_tokens, current_receipt))

@@ -2,6 +2,7 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
+import { remarkPageCitations } from './pageCitations';
 
 export function normalizeMath(content: string): string {
   return content.split(/(```[\s\S]*?```|~~~[\s\S]*?~~~|`[^`\n]*`)/g).map((part, index) => {
@@ -12,9 +13,9 @@ export function normalizeMath(content: string): string {
 }
 
 export function Markdown({ content, onPage }: { content: string; onPage?: (page: number) => void }) {
-  return <div className="markdown"><ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]} skipHtml
+  return <div className="markdown"><ReactMarkdown remarkPlugins={[remarkGfm, remarkMath, remarkPageCitations]} rehypePlugins={[rehypeKatex]} skipHtml
     components={{ a: ({ href, children }) => {
-      const page = href?.match(/(?:#|[?&])page=(\d+)/)?.[1];
+      const page = href?.match(/^#page=(\d+)$/)?.[1];
       if (page && onPage) return <button className="inline-link" onClick={() => onPage(Number(page))}>{children}</button>;
       return <a href={href} target="_blank" rel="noreferrer">{children}</a>;
     } }}

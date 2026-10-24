@@ -30,7 +30,10 @@ def translation_client(tmp_path, monkeypatch):
         yield client, translator
 
 
-def response(content="这是完整的中文译文。", finish="stop"):
+def response(content="这是完整的中文译文。", finish="stop", source=None):
+    if source is not None:
+        from backend.translation_alignment import source_blocks
+        content = "\n\n".join(f"<!-- source:{block['id']} -->\n{content}" for block in source_blocks(source))
     return {"choices": [{"finish_reason": finish, "message": {"content": content}}],
             "usage": {"prompt_tokens": 200, "prompt_cache_hit_tokens": 50, "completion_tokens": 300}}
 
@@ -59,7 +62,7 @@ def test_estimate_is_free_and_cache_is_idempotent(translation_client):
     client, translator = translation_client
     paper = upload(client)
     calls = []
-    translator.call_provider = lambda *args: calls.append(args) or response()
+    translator.call_provider = lambda *args: calls.append(args) or response(source=args[1])
     quote = estimate(client, paper, [1, 1])
     assert quote["total_pages"] == 1
     assert quote["upper_bound_cny"] > quote["estimated_cny"] > 0
@@ -86,7 +89,10 @@ def test_estimate_is_free_and_cache_is_idempotent(translation_client):
     assert settings["reserved_cny"] == 0
     assert "sk-translation-test-only" not in json.dumps(settings)
     client.delete(f"/api/papers/{paper['id']}")
-    assert translator.cached(paper["id"], 1) is None
+    assert translator.cached(paper["id"], 1)
+    assert client.get(f"/api/papers/{paper['id']}/translations/pages/1").status_code == 404
+    assert client.post(f"/api/library/trash/paper/{paper['id']}/restore").status_code == 200
+    assert client.get(f"/api/papers/{paper['id']}/translations/pages/1").json()["translation"]
     assert client.get("/api/translation/settings").json()["spent_cny"] == settings["spent_cny"]
 
 
@@ -150,7 +156,7 @@ def test_cancel_stops_next_page_and_keeps_finished_page(translation_client):
         calls.append(args)
         entered.set()
         assert release.wait(5)
-        return response()
+        return response(source=args[1])
 
     translator.call_provider = blocking
     try:
@@ -179,7 +185,7 @@ def test_global_reservation_prevents_concurrent_overspending(translation_client)
     def blocking(*args):
         entered.set()
         assert release.wait(5)
-        return response()
+        return response(source=args[1])
 
     translator.call_provider = blocking
     try:
@@ -269,7 +275,7 @@ def test_variants_keep_cache_separate_and_use_selected_prices(translation_client
 
     def provider(*args):
         calls.append(args)
-        value = response(f"译文：{args[3]} / {args[4]}")
+        value = response(f"译文：{args[3]} / {args[4]}", source=args[1])
         value["usage"]["completion_tokens_details"] = {"reasoning_tokens": 100}
         return value
 
@@ -477,7 +483,7 @@ def test_key_cannot_change_while_a_translation_is_running(translation_client):
         entered.set()
         assert release.wait(5)
         assert args[0] == "sk-translation-test-only"
-        return response()
+        return response(source=args[1])
     translator.call_provider = blocking
     translator.balance_provider = lambda key: pytest.fail("Must reject key change before verification")
     try:
@@ -487,3 +493,23 @@ def test_key_cannot_change_while_a_translation_is_running(translation_client):
     finally:
         release.set()
     assert wait(client, job["id"])["status"] == "completed"
+
+
+def test_cancel_during_source_preparation_prevents_first_paid_call(translation_client, monkeypatch):
+    client, translator = translation_client
+    paper = upload(client)
+    quote = estimate(client, paper)
+    original = translator.source_page
+
+    def cancel_during_source(paper_id, page):
+        with translator.store.connection() as connection:
+            connection.execute("UPDATE translation_jobs SET status='cancelling' WHERE paper_id=? AND status='running'", (paper_id,))
+        return original(paper_id, page)
+
+    monkeypatch.setattr(translator, "source_page", cancel_during_source)
+    translator.call_provider = lambda *_: pytest.fail("A cancelled request must not enter the provider")
+    job = wait(client, start(client, paper, quote).json()["id"])
+    assert job["status"] == "cancelled" and job["completed_pages"] == 0
+    assert translator.settings()["spent_cny"] == 0
+    with translator.store.connection() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM translation_receipts").fetchone()[0] == 0

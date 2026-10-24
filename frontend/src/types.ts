@@ -1,4 +1,6 @@
 export type NoteKind = 'guide' | 'concept' | 'method' | 'experiment' | 'critique' | 'exercise' | 'note';
+export type VerificationStatus = 'unverified' | 'verified' | 'needs_review';
+export interface NoteEvidence { page: number; quote: string; label: string }
 export interface Note {
   id: string;
   title: string;
@@ -8,6 +10,8 @@ export interface Note {
   content: string;
   sort_order: number;
   completed: boolean;
+  evidence: NoteEvidence[];
+  verification_status: VerificationStatus;
 }
 export type NoteInput = Omit<Note, 'id'>;
 export interface ReadingProgress { page: number; zoom: number; active_note_id: string | null }
@@ -41,5 +45,8 @@ export interface MetadataPreview {
   warnings: string[];
 }
 export const kindLabels: Record<NoteKind, string> = {
-  guide: '导读', concept: '概念', method: '方法', experiment: '实验', critique: '评析', exercise: '旧版笔记', note: '笔记',
+  guide: '整篇总览', concept: '概念', method: '方法', experiment: '实验', critique: '评析', exercise: '旧版笔记', note: '个人笔记',
+};
+export const verificationLabels: Record<VerificationStatus, string> = {
+  unverified: '未核验', verified: '已核验', needs_review: '待复核',
 };

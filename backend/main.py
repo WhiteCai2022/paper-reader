@@ -26,6 +26,9 @@ from .store import Store
 from .reading import reading_task
 from .translation import TranslationService, router as translation_router
 from .reading_api import ReadingService, router as reading_router
+from .library_safety import router as library_safety_router
+from .evidence import router as evidence_router
+from .trash import router as trash_router
 
 
 APP_DIR = Path(__file__).resolve().parent.parent
@@ -53,6 +56,8 @@ def validate(model, value):
 def validate_note_pages(note: NoteCreate, page_count: int):
     if note.page_start > page_count or note.page_end > page_count:
         raise HTTPException(status_code=422, detail=f"Note pages must be between 1 and {page_count}")
+    if any(item.page > page_count for item in note.evidence):
+        raise HTTPException(status_code=422, detail=f"Evidence pages must be between 1 and {page_count}")
 
 
 def filename_only(name: str | None, fallback="document.pdf") -> str:
@@ -122,7 +127,7 @@ def export_markdown(paper):
     parts = [f"<!-- paper-reader: {comment_json(document)} -->", "", f"# {paper['title']}", ""]
     for note in paper["notes"]:
         pages = str(note["page_start"]) if note["page_start"] == note["page_end"] else f"{note['page_start']}-{note['page_end']}"
-        note_meta = {name: note[name] for name in ("kind", "sort_order", "completed")}
+        note_meta = {name: note[name] for name in ("kind", "sort_order", "completed", "evidence", "verification_status")}
         parts.extend([f"## [p. {pages}] {note['title']}", f"<!-- paper-reader-note: {comment_json(note_meta)} -->", "", note["content"], ""])
     return "\n".join(parts)
 
@@ -192,7 +197,7 @@ def parse_markdown(text, fallback_title):
                 note_metadata = json.loads(match[1])
             except (ValueError, TypeError) as error:
                 raise HTTPException(status_code=422, detail="Invalid note metadata JSON") from error
-            if not isinstance(note_metadata, dict) or not set(note_metadata).issubset({"kind", "completed", "sort_order"}):
+            if not isinstance(note_metadata, dict) or not set(note_metadata).issubset({"kind", "completed", "sort_order", "evidence", "verification_status"}):
                 raise HTTPException(status_code=422, detail="Unsupported note metadata")
             section.update(note_metadata)
             content_lines.pop(first_content)
@@ -427,7 +432,6 @@ def create_app(data_dir=None, frontend_dist=None):
     @application.delete("/api/papers/{paper_id}", status_code=204)
     def delete_paper(paper_id: str, request: Request):
         request.app.state.translator.cancel_paper(paper_id)
-        request.app.state.reader.remove_paper(paper_id)
         if not store(request).delete_paper(paper_id):
             raise HTTPException(status_code=404, detail="Paper not found")
         return Response(status_code=204)
@@ -454,8 +458,12 @@ def create_app(data_dir=None, frontend_dist=None):
         current = store(request).get_note(paper_id, note_id)
         if current is None:
             raise HTTPException(status_code=404, detail="Note not found")
+        values = patch.model_dump(exclude_unset=True)
+        if (current["verification_status"] == "verified" and "verification_status" not in values
+                and any(name in values and values[name] != current[name] for name in ("title", "content", "page_start", "page_end", "kind", "evidence"))):
+            values["verification_status"] = "needs_review"
         current.pop("id")
-        current.update(patch.model_dump(exclude_unset=True))
+        current.update(values)
         note = validate(NoteCreate, current)
         validate_note_pages(note, paper["page_count"])
         return store(request).update_note(paper_id, note_id, note.model_dump())
@@ -530,6 +538,9 @@ def create_app(data_dir=None, frontend_dist=None):
 
     application.include_router(translation_router)
     application.include_router(reading_router)
+    application.include_router(library_safety_router)
+    application.include_router(evidence_router)
+    application.include_router(trash_router)
 
     @application.get("/{path:path}", include_in_schema=False)
     def frontend(path: str):

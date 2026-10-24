@@ -138,6 +138,20 @@ class DoiQuery(Model):
         return value
 
 
+class Evidence(Model):
+    page: Page
+    quote: Annotated[str, Field(min_length=10, max_length=2000)]
+    label: Annotated[str, Field(max_length=200)] = ""
+
+    @field_validator("quote")
+    @classmethod
+    def clean_quote(cls, value: str) -> str:
+        value = value.strip()
+        if len(value) < 10:
+            raise ValueError("Evidence quote must contain at least 10 characters")
+        return value
+
+
 class NoteCreate(Model):
     title: Title = "Note"
     page_start: Page = 1
@@ -146,6 +160,8 @@ class NoteCreate(Model):
     content: Content = ""
     sort_order: SortOrder = 0
     completed: StrictBool = False
+    evidence: list[Evidence] = Field(default_factory=list, max_length=32)
+    verification_status: Literal["unverified", "verified", "needs_review"] = "unverified"
 
     @model_validator(mode="after")
     def validate_range(self):
@@ -167,6 +183,8 @@ class NotePatch(Model):
     content: Content | None = None
     sort_order: SortOrder | None = None
     completed: StrictBool | None = None
+    evidence: list[Evidence] | None = Field(default=None, max_length=32)
+    verification_status: Literal["unverified", "verified", "needs_review"] | None = None
 
     @model_validator(mode="after")
     def reject_null_fields(self):
