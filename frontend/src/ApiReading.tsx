@@ -6,6 +6,10 @@ import type { AiOptions } from './AiOptions';
 import { ApiBalance, ApiSettingsDialog } from './ApiSettings';
 import type { TranslationSettings } from './ApiSettings';
 import { Markdown } from './Markdown';
+import { NoteSection } from './NoteSection';
+import { readingStyleLabel as workflowLabel } from './readingStyle';
+import { ReadingOutput } from './ReadingOutputField';
+import { matchesReadingOutput, recommendedReadingOutput, resolveReadingOutput } from './readingOutput';
 import type { NoteInput, Paper } from './types';
 
 interface Stage { kind: string; label: string; first: number; last: number; max_tokens: number }
@@ -19,17 +23,24 @@ interface ReadingJob {
   completed_stages: number; total_stages: number; cost_cny: number; error: string; imported_at: string | null;
   created_at: string; notes_count: number; notes: NoteInput[]; stages: Stage[]; last_attempt: Attempt | null; has_rejected_output: boolean;
   can_resume: boolean; remaining_stages: number; can_revalidate?: boolean;
+  workflow?: string;
+  reading_style?: string;
+  validation_warnings?: { stage: number; note_index: number; code: string; message: string; field: string }[];
 }
 interface ReadingList { jobs: ReadingJob[]; settings: TranslationSettings }
 interface ReadingQuote {
   quote_id: string; model: string; reasoning_effort: string; focus: string; page_count: number;
   estimated_cny: number; upper_bound_cny: number; settings: TranslationSettings; stages: Stage[]; warning: string;
   resume_job_id?: string; completed_stages?: number; total_stages?: number; remaining_stages?: number;
+  workflow?: string;
+  reading_style?: string;
+  max_output_tokens?: number | null; requested_max_output_tokens?: number | null;
+  output_limit_changed?: boolean; previous_output_limits?: number[];
 }
 const active = (job?: ReadingJob | null) => !!job && ['queued', 'running', 'cancelling'].includes(job.status);
 const money = (value: number) => value.toFixed(4);
 const statusLabels: Record<string, string> = { queued: '等待生成', running: '后台生成中', cancelling: '正在停止后续阶段', cancelled: '已停止', completed: '草稿生成完成', failed: '生成未完成', interrupted: '服务重启，任务已中断' };
-const statusOf = (job: ReadingJob) => job.status === 'failed' && job.last_attempt?.local_revalidated ? '本阶段已恢复，等待续读' : statusLabels[job.status] || job.status;
+const statusOf = (job: ReadingJob) => job.status === 'failed' && job.last_attempt?.local_revalidated ? '本阶段已恢复，等待续读' : job.status === 'completed' && job.validation_warnings?.length ? '草稿已生成，有待复核项' : statusLabels[job.status] || job.status;
 const when = (value: string) => new Date(value.replace(' ', 'T') + 'Z').toLocaleString('zh-CN');
 
 export function ApiReading({ paper, focus, onFocus, onImported, onBusy }: {
@@ -37,6 +48,8 @@ export function ApiReading({ paper, focus, onFocus, onImported, onBusy }: {
 }) {
   const [options, setOptions] = useState<AiOptions>({ model: 'deepseek-flash', reasoning_effort: 'none' });
   const [budget, setBudget] = useState(2);
+  const [outputLimit, setOutputLimit] = useState('auto');
+  const [resumeOutputLimit, setResumeOutputLimit] = useState('auto');
   const [list, setList] = useState<ReadingList | null>(null);
   const [selected, setSelected] = useState('');
   const selectedRef = useRef(selected); selectedRef.current = selected;
@@ -53,12 +66,13 @@ export function ApiReading({ paper, focus, onFocus, onImported, onBusy }: {
   const [resumeQuote, setResumeQuote] = useState<ReadingQuote | null>(null);
   const [confirmResume, setConfirmResume] = useState(false);
   const [draftKind, setDraftKind] = useState('all');
+  const [draftCritiqueOpen, setDraftCritiqueOpen] = useState(false);
   const confirmRef = useRef<HTMLDivElement>(null);
   const endpoint = `/api/papers/${encodeURIComponent(paper.id)}/reading`;
   const callbacks = useRef({ onBusy }); callbacks.current = { onBusy };
   useEffect(() => { callbacks.current.onBusy(busy); return () => callbacks.current.onBusy(false); }, [busy]);
   useEffect(() => { if (confirmStart || confirmImport || confirmResume) confirmRef.current?.scrollIntoView({ block: 'nearest' }); }, [confirmStart, confirmImport, confirmResume]);
-  useEffect(() => { setResumeQuote(null); setConfirmResume(false); setDraftKind('all'); }, [selected]);
+  useEffect(() => { setResumeQuote(null); setConfirmResume(false); setResumeOutputLimit('auto'); setDraftKind('all'); setDraftCritiqueOpen(false); }, [selected]);
   const load = useCallback(async () => {
     const value = await api<ReadingList>(`${endpoint}/jobs`);
     setList(value);
@@ -76,6 +90,9 @@ export function ApiReading({ paper, focus, onFocus, onImported, onBusy }: {
     return () => controller.abort();
   }, [selected]);
   const running = !!list?.jobs.some(active) || active(job);
+  const outputTokens = resolveReadingOutput(outputLimit, recommendedReadingOutput(options.reasoning_effort));
+  const resumeRecommended = Math.max(recommendedReadingOutput(job?.reasoning_effort || 'none'), ...(job?.stages.slice(job.completed_stages).map(stage => stage.max_tokens) || []));
+  const resumeOutputTokens = resolveReadingOutput(resumeOutputLimit, resumeRecommended);
   useEffect(() => {
     if (!running) return;
     const timer = setInterval(() => { void load().catch(failure => setError(messageOf(failure))); }, 2000);
@@ -89,25 +106,29 @@ export function ApiReading({ paper, focus, onFocus, onImported, onBusy }: {
   useEffect(() => {
     const controller = new AbortController(); setQuote(null); setQuoteError(''); setEstimating(true); setConfirmStart(false);
     if (running) { setEstimating(false); return; }
+    if (outputTokens === null || !Number.isFinite(outputTokens)) { setEstimating(false); return; }
     const timer = setTimeout(() => {
-      api<ReadingQuote>(`${endpoint}/estimate`, { method: 'POST', body: JSON.stringify({ ...options, focus }), signal: controller.signal })
+      api<ReadingQuote>(`${endpoint}/estimate`, { method: 'POST', body: JSON.stringify({ ...options, focus, max_output_tokens: outputTokens }), signal: controller.signal })
         .then(value => { if (!controller.signal.aborted) { setQuote(value); setEstimating(false); } })
         .catch(failure => { if (!controller.signal.aborted) { setQuoteError(messageOf(failure)); setEstimating(false); } });
     }, 400);
     return () => { clearTimeout(timer); controller.abort(); };
-  }, [endpoint, options.model, options.reasoning_effort, focus, running, attempt]);
-  const matches = !!quote && quote.model === options.model && quote.reasoning_effort === options.reasoning_effort && quote.focus === focus.trim();
+  }, [endpoint, options.model, options.reasoning_effort, focus, running, attempt, outputTokens]);
+  const matches = !!quote && quote.model === options.model && quote.reasoning_effort === options.reasoning_effort && quote.focus === focus.trim() && matchesReadingOutput(quote.max_output_tokens, outputTokens);
+  const resumeMatches = !!resumeQuote && resumeQuote.resume_job_id === job?.id && matchesReadingOutput(resumeQuote.requested_max_output_tokens, resumeOutputTokens);
   const exceeds = !Number.isFinite(budget) || budget < 0 || budget > 1000 ? '请输入 0–1000 元的有效预算。'
-    : matches && quote.upper_bound_cny > budget ? '精读费用上限超过单次预算，请调整模型、推理强度或预算。'
+    : matches && quote.upper_bound_cny > budget ? '精读费用上限超过单次预算，请降低输出上限、调整模型或手动提高预算。'
     : matches && quote.upper_bound_cny > quote.settings.remaining_cny ? '本程序累计剩余额度不足，请在 API 设置中调整费用控制。'
     : matches && !quote.settings.configured ? '请先绑定 DeepSeek API Key。' : '';
   const resumeExceeds = !Number.isFinite(budget) || budget < 0 || budget > 1000 ? '请输入有效的单次预算。'
     : resumeQuote && resumeQuote.upper_bound_cny > budget ? '剩余阶段费用上限超过单次预算。'
     : resumeQuote && resumeQuote.upper_bound_cny > resumeQuote.settings.remaining_cny ? '本程序累计剩余额度不足。' : '';
   async function estimateResume() {
-    if (!job?.can_resume || running) return; setBusy(true); setError('');
+    if (!job?.can_resume || running) return;
+    if (Number.isNaN(resumeOutputTokens)) { setConfirmResume(true); return; }
+    setBusy(true); setError('');
     try {
-      const value = await api<ReadingQuote>(`/api/reading/jobs/${job.id}/resume/estimate`, { method: 'POST' });
+      const value = await api<ReadingQuote>(`/api/reading/jobs/${job.id}/resume/estimate`, { method: 'POST', body: JSON.stringify({ max_output_tokens: resumeOutputTokens }) });
       setResumeQuote(value); setConfirmResume(true); setConfirmStart(false); setConfirmImport(false);
     } catch (failure) { setError(messageOf(failure)); } finally { setBusy(false); }
   }
@@ -119,7 +140,7 @@ export function ApiReading({ paper, focus, onFocus, onImported, onBusy }: {
     } catch (failure) { setError(messageOf(failure)); } finally { setBusy(false); }
   }
   async function resume() {
-    if (!resumeQuote || !job || resumeExceeds || running) return; setBusy(true); setError('');
+    if (!resumeQuote || !resumeMatches || !job || resumeExceeds || running) return; setBusy(true); setError('');
     try {
       const value = await api<ReadingJob>(`/api/reading/jobs/${job.id}/resume`, { method: 'POST', body: JSON.stringify({ quote_id: resumeQuote.quote_id, max_cost_cny: budget }) });
       setJob(value); setConfirmResume(false); setResumeQuote(null); setQuote(null); await load();
@@ -146,36 +167,50 @@ export function ApiReading({ paper, focus, onFocus, onImported, onBusy }: {
       setJob(value.job); setConfirmImport(false); await onImported(); await load();
     } catch (failure) { setError(messageOf(failure)); } finally { setBusy(false); }
   }
+  const draftNotes = (job?.notes || []).filter(note => draftKind === 'all' || note.kind === draftKind);
+  const critiqueNotes = draftNotes.filter(note => note.kind === 'critique');
+  const draftNote = (note: NoteInput, index: number) => <details key={`${job?.id}:${note.sort_order}:${note.title}`} open={index === 0 && (note.kind !== 'critique' || draftKind === 'critique')}><summary><span>{note.title}</span><small>第 {note.page_start}{note.page_end !== note.page_start ? `–${note.page_end}` : ''} 页</small></summary><Markdown content={note.content} /></details>;
   return <div className="api-reading dialog-form">
     <div className="api-reading-scroll">
       <div className="reading-task-paper"><strong>{paper.short_title || paper.title}</strong><span>{paper.page_count} 页 · {paper.notes_count} 条已有解析</span></div>
       <div className="reading-task-status">API 精读草稿 · 尚未人工核验 · 不含自测</div>
       <OptionsFields options={options} onChange={setOptions} disabled={busy || running} />
+      <ReadingOutput value={outputLimit} onChange={setOutputLimit} recommended={recommendedReadingOutput(options.reasoning_effort)} disabled={busy || running} thinking={options.reasoning_effort !== 'none'} />
       <label>阅读重点（可选）<textarea className="reading-focus" maxLength={2000} value={focus} onChange={event => onFocus(event.target.value)} disabled={busy || running} /></label>
       <label>单次预算（元）<input type="number" aria-label="精读单次预算" min={0} max={1000} step="0.1" value={budget} disabled={busy || running} onChange={event => setBudget(Number(event.target.value))} /></label>
       {estimating && <div className="reading-task-status"><LoaderCircle className="spin" size={15} />正在提取全文并估算费用</div>}
-      {matches && !running && <><ol className="reading-plan">{quote.stages.map((stage, index) => <li key={index}>{stage.label}<small>输出上限 {stage.max_tokens.toLocaleString('zh-CN')} token{quote.reasoning_effort !== 'none' ? '（含推理）' : ''}</small></li>)}</ol><div className="translation-cost-list"><span>API 请求次数<strong>{quote.stages.length} 次 · 单篇 {quote.page_count} 页</strong></span><span>预计费用<strong>¥{money(quote.estimated_cny)}</strong></span><span>保守费用上限<strong>¥{money(quote.upper_bound_cny)}</strong></span></div></>}
+      {matches && !running && <><h3 className="reading-workflow-heading">新草稿 · {workflowLabel(quote)}</h3><ol className="reading-plan">{quote.stages.map((stage, index) => <li key={index}>{stage.label}<small>输出上限 {stage.max_tokens.toLocaleString('zh-CN')} token{quote.reasoning_effort !== 'none' ? '（含推理）' : ''}</small></li>)}</ol><div className="translation-cost-list"><span>API 请求次数<strong>{quote.stages.length} 次 · 单篇 {quote.page_count} 页</strong></span><span>预计费用<strong>¥{money(quote.estimated_cny)}</strong></span><span>保守费用上限<strong>¥{money(quote.upper_bound_cny)}</strong></span></div></>}
       {(list || quote) && <div className="reading-api-balance"><ApiBalance settings={(list?.settings || quote!.settings)} onBind={() => setSettingsOpen(true)} refreshToken={job ? `${job.id}:${active(job) ? 'active' : job.status}` : ''} /><button className="icon-button" title="API 设置" aria-label="精读 API 设置" onClick={() => setSettingsOpen(true)}><Settings2 size={16} /></button></div>}
       {list && list.jobs.length > 0 && <label>生成记录<select aria-label="精读生成记录" disabled={busy} value={selected} onChange={event => { setSelected(event.target.value); setConfirmImport(false); }}>
         {list.jobs.map(item => <option key={item.id} value={item.id}>{when(item.created_at)} · {statusOf(item)} · {configLabel(item.model, item.reasoning_effort)}</option>)}
       </select></label>}
       {job && <div className="reading-job"><div className="reading-job-heading"><strong>{active(job) ? <LoaderCircle className="spin" size={15} /> : job.status === 'completed' ? <Check size={15} /> : <BookOpen size={15} />}{statusOf(job)}</strong><span>{job.completed_stages} / {job.total_stages} 阶段</span>{active(job) && <button className="icon-button" title="停止后续阶段，进行中的请求仍可能计费" aria-label="停止精读后续阶段" disabled={busy || job.status === 'cancelling'} onClick={() => void cancel()}><Square size={14} /></button>}</div>
+        <div className="reading-job-workflow">原任务 · {workflowLabel(job)}</div>
         <progress value={job.completed_stages} max={job.total_stages} />
         {active(job) && <div className="muted">{job.stages[job.completed_stages]?.label || '正在保存草稿'}</div>}
         <div className="reading-job-meta"><span>{job.notes_count} 条草稿 · 已记账 ¥{money(job.cost_cny)}</span><span>{job.imported_at ? '已追加到解析' : '尚未导入解析'}</span></div>
         {job.status === 'failed' && job.last_attempt && <div className="reading-attempt"><strong>最近请求 · 第 {job.last_attempt.stage} 阶段 · {job.last_attempt.label}</strong><span>输出 {job.last_attempt.output_tokens.toLocaleString('zh-CN')} / 上限 {job.last_attempt.max_tokens.toLocaleString('zh-CN')} token{job.reasoning_effort !== 'none' ? '（含推理）' : ''}{job.last_attempt.reasoning_tokens !== null ? ` · 推理 ${job.last_attempt.reasoning_tokens.toLocaleString('zh-CN')} token` : ''}</span></div>}
         {job.error && <div className={job.last_attempt?.local_revalidated ? 'form-warning' : 'form-error'} role={job.last_attempt?.local_revalidated ? 'status' : 'alert'}>{job.error}</div>}
         {job.last_attempt?.local_revalidated && <div className="muted">已使用保存的返回内容在本地恢复本阶段，未新增 API 调用或费用；仍须人工核验。</div>}
-        {job.can_revalidate && !running && <button className="button" disabled={busy} onClick={() => void revalidate()}><RefreshCw size={14} />本地重新校验证据（免费）</button>}
+        {!!job.validation_warnings?.length && <details className="form-warning reading-validation-warnings"><summary>{job.validation_warnings.length} 项自动检查提示 · 相关草稿已标记待复核</summary><ul>{job.validation_warnings.map((warning, index) => <li key={index}>第 {warning.stage} 阶段 · 第 {warning.note_index} 条：{warning.message}</li>)}</ul></details>}
+        {job.can_revalidate && !running && <button className="button" disabled={busy} onClick={() => void revalidate()}><RefreshCw size={14} />本地检查并恢复草稿（免费）</button>}
         {job.has_rejected_output && <a className="reading-rejected-download" href={`/api/reading/jobs/${job.id}/rejected-output`} download><Download size={13} />{job.last_attempt?.local_revalidated ? '下载原始返回' : '下载未通过结果'}</a>}
         {job.status === 'failed' && job.notes_count === 0 && <div className="muted">本次尚未生成有效草稿，已有解析未改动。</div>}
       </div>}
-      {job?.notes?.length ? <div className="reading-draft-preview"><label>草稿类别<select aria-label="筛选草稿类别" value={draftKind} onChange={event => setDraftKind(event.target.value)}><option value="all">全部类别（{job.notes.length}）</option>{[['guide', '整篇总览'], ['concept', '概念'], ['method', '方法'], ['experiment', '实验'], ['critique', '评析'], ['note', '笔记']].map(([kind, label]) => <option key={kind} value={kind}>{label}（{job.notes.filter(note => note.kind === kind).length}）</option>)}</select></label>{job.notes.filter(note => draftKind === 'all' || note.kind === draftKind).map((note, index) => <details key={`${job.id}:${note.sort_order}:${note.title}`} open={index === 0}><summary><span>{note.title}</span><small>第 {note.page_start}{note.page_end !== note.page_start ? `–${note.page_end}` : ''} 页</small></summary><Markdown content={note.content} /></details>)}{draftKind !== 'all' && !job.notes.some(note => note.kind === draftKind) && <div className="empty-inline">本次草稿尚无此类别</div>}</div> : null}
+      {job?.notes?.length ? <div className="reading-draft-preview">
+        <label>草稿类别<select aria-label="筛选草稿类别" value={draftKind} onChange={event => { setDraftKind(event.target.value); if (event.target.value === 'critique') setDraftCritiqueOpen(true); }}><option value="all">全部类别（{job.notes.length}）</option>{[['guide', '整篇总览'], ['concept', '概念'], ['method', '方法'], ['experiment', '实验'], ['critique', '评析'], ['note', '笔记']].map(([kind, label]) => <option key={kind} value={kind}>{label}（{job.notes.filter(note => note.kind === kind).length}）</option>)}</select></label>
+        {draftNotes.filter(note => note.kind !== 'critique').map(draftNote)}
+        {!!critiqueNotes.length && <NoteSection kind="critique" count={critiqueNotes.length} expanded={draftCritiqueOpen} onExpandedChange={setDraftCritiqueOpen}>{critiqueNotes.map(draftNote)}</NoteSection>}
+        {draftKind !== 'all' && !draftNotes.length && <div className="empty-inline">本次草稿尚无此类别</div>}
+      </div> : null}
       {(error || quoteError) && <div className="form-error" role="alert">{error || quoteError}</div>}
       {exceeds && !running && !confirmResume && <div className="form-warning" role="status">{exceeds}</div>}
       {confirmStart && matches && <div className="reading-confirm" ref={confirmRef} role="alert"><strong>确认调用 DeepSeek？</strong><p>将发送本篇论文提取文本与阅读重点，共 {quote.stages.length} 次请求，保守费用上限 ¥{money(quote.upper_bound_cny)}。生成新草稿，不覆盖已有解析；中断不自动重试，已完成请求仍计费。</p><div><button className="button" disabled={busy} onClick={() => setConfirmStart(false)}>取消</button><button className="button primary" disabled={busy || !!exceeds} onClick={() => void start()}><Play size={14} />{busy ? '提交中…' : '确认调用 API'}</button></div></div>}
       {confirmImport && job && <div className="reading-confirm" ref={confirmRef} role="alert"><strong>追加 {job.notes_count} 条 API 草稿？</strong><p>保留已有 {paper.notes_count} 条解析，新内容标注为尚未人工核验，不会覆盖或标记为已完成。</p><div><button className="button" disabled={busy} onClick={() => setConfirmImport(false)}>取消</button><button className="button primary" disabled={busy} onClick={() => void append()}><Check size={14} />确认追加</button></div></div>}
-      {confirmResume && resumeQuote && job && <div className="reading-confirm" ref={confirmRef} role="alert"><strong>从未完成阶段继续？</strong><p>保留已完成的 {resumeQuote.completed_stages} 个阶段和 {job.notes_count} 条草稿，仅调用剩余 {resumeQuote.remaining_stages} 个阶段。沿用原任务的 {configLabel(resumeQuote.model, resumeQuote.reasoning_effort)}，不采用上方的新任务配置。预计 ¥{money(resumeQuote.estimated_cny)}，保守费用上限 ¥{money(resumeQuote.upper_bound_cny)}；本次仍需确认费用，不自动重试。</p>{resumeExceeds && <p className="form-warning">{resumeExceeds}</p>}<div><button className="button" disabled={busy} onClick={() => setConfirmResume(false)}>取消</button><button className="button primary" disabled={busy || !!resumeExceeds} onClick={() => void resume()}><RotateCcw size={14} />确认继续 API</button></div></div>}
+      {confirmResume && resumeQuote && job && <div className="reading-confirm" ref={confirmRef} role="alert"><strong>从未完成阶段继续？</strong><p>保留已完成的 {resumeQuote.completed_stages} 个阶段和 {job.notes_count} 条草稿，仅调用剩余 {resumeQuote.remaining_stages} 个阶段。沿用原任务的“{workflowLabel(job)}”及 {configLabel(resumeQuote.model, resumeQuote.reasoning_effort)}，此处仅调整剩余阶段的输出上限，不改变原流程、模型或推理强度。</p>
+        <ReadingOutput value={resumeOutputLimit} onChange={setResumeOutputLimit} recommended={resumeRecommended} disabled={busy || running} resume thinking={job.reasoning_effort !== 'none'} />
+        {!resumeMatches ? <p className="form-warning" role="status">输出上限已修改，请更新续读估算后再确认。</p> : <><ol className="reading-plan" start={(resumeQuote.completed_stages || 0) + 1}>{resumeQuote.stages.map((stage, index) => <li key={index}>{stage.label}<small>输出上限 {resumeQuote.previous_output_limits?.[index] !== stage.max_tokens && resumeQuote.previous_output_limits?.[index] !== undefined ? `${resumeQuote.previous_output_limits[index].toLocaleString('zh-CN')} → ` : ''}{stage.max_tokens.toLocaleString('zh-CN')} token</small></li>)}</ol><p>预计 ¥{money(resumeQuote.estimated_cny)}，保守费用上限 ¥{money(resumeQuote.upper_bound_cny)}；本次仍需确认费用，不自动重试。</p>{resumeExceeds && <p className="form-warning">{resumeExceeds}</p>}</>}
+        <div><button className="button" disabled={busy} onClick={() => setConfirmResume(false)}>取消</button><button className="button" disabled={busy || Number.isNaN(resumeOutputTokens)} onClick={() => void estimateResume()}><RefreshCw size={14} />更新续读估算</button><button className="button primary" disabled={busy || !resumeMatches || !!resumeExceeds} onClick={() => void resume()}><RotateCcw size={14} />确认继续 API</button></div></div>}
     </div>
     <footer className="modal-footer reading-api-footer"><div>{job && job.notes_count > 0 && <><a className="icon-button" title="导出精读 JSON" aria-label="导出精读 JSON" href={`/api/reading/jobs/${job.id}/export?format=json`} download><Download size={16} /></a><a className="button" href={`/api/reading/jobs/${job.id}/export?format=markdown`} download>Markdown</a></>}{job?.status === 'completed' && !job.imported_at && <button className="button" disabled={busy} onClick={() => { setConfirmImport(true); setConfirmStart(false); }}><Check size={14} />追加到解析</button>}</div>
       <div>{job?.can_resume && !running && <button className="button" disabled={busy} onClick={() => void estimateResume()}><RotateCcw size={15} />继续未完成阶段</button>}<button className="icon-button" title="重新估算" aria-label="重新估算精读费用" disabled={busy || estimating || running} onClick={() => setAttempt(value => value + 1)}><RefreshCw size={15} /></button><button className="button primary" disabled={busy || estimating || running || !matches || !!exceeds} onClick={() => { setConfirmStart(true); setConfirmImport(false); setConfirmResume(false); }}><Play size={15} />生成新草稿</button></div>

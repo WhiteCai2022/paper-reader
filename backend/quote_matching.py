@@ -7,6 +7,16 @@ import unicodedata
 WRAP_MARKER = "\x00"
 LINE_HYPHEN = re.compile(r"(?<=[^\W\d_])[-\u2010\u2011][ \t]*\r?\n[ \t]*(?=[^\W\d_])")
 SOFT_HYPHEN = re.compile(r"\u00ad(?:[ \t]*\r?\n[ \t]*)?")
+CJK_PUNCTUATION = set("。，、；：！？（）《》〈〉「」『』【】〔〕“”‘’,.;:!?()[]\"'")
+
+
+def _cjk(character):
+    code = ord(character)
+    return 0x3400 <= code <= 0x9FFF or 0xF900 <= code <= 0xFAFF or 0x20000 <= code <= 0x323AF
+
+
+def _word_letter(character):
+    return character.isalpha() and not _cjk(character)
 
 
 def _canonical(text):
@@ -20,10 +30,12 @@ def _canonical(text):
     value = "".join(characters)
     wraps = {}
     for match in LINE_HYPHEN.finditer(value):
+        if not (_word_letter(value[match.start() - 1]) and _word_letter(value[match.end()])):
+            continue
         left, right = match.start(), match.end()
-        while left and value[left - 1].isalpha():
+        while left and _word_letter(value[left - 1]):
             left -= 1
-        while right < len(value) and value[right].isalpha():
+        while right < len(value) and _word_letter(value[right]):
             right += 1
         if match.start() - left + right - match.end() >= 5:
             wraps[match.start()] = match.end()
@@ -41,6 +53,15 @@ def _canonical(text):
             continue
         character = value[index]
         if character.isspace():
+            end = index + 1
+            while end < len(value) and value[end].isspace():
+                end += 1
+            left, right = value[index - 1] if index else "", value[end] if end < len(value) else ""
+            # Chinese PDF line wrapping is not a word separator. Preserve Latin and numeric spacing.
+            if left and right and ((_cjk(left) and (_cjk(right) or right in CJK_PUNCTUATION))
+                                   or (_cjk(right) and left in CJK_PUNCTUATION)):
+                index = end
+                continue
             if result and result[-1] == " ":
                 positions[-1] = (positions[-1][0], offsets[index][1])
             else:
@@ -70,10 +91,10 @@ def quote_matches(quote, source):
     matches, start = [], 0
     while match := pattern.search(text, start):
         start = match.start() + 1
-        if match.start() and ((query[0].isalpha() and text[match.start() - 1].isalpha())
+        if match.start() and ((_word_letter(query[0]) and _word_letter(text[match.start() - 1]))
                               or (query[0].isdecimal() and text[match.start() - 1].isdecimal())):
             continue
-        if match.end() < len(text) and ((query[-1].isalpha() and text[match.end()].isalpha())
+        if match.end() < len(text) and ((_word_letter(query[-1]) and _word_letter(text[match.end()]))
                                       or (query[-1].isdecimal() and text[match.end()].isdecimal())):
             continue
         matches.append(source[positions[match.start()][0]:positions[match.end() - 1][1]])

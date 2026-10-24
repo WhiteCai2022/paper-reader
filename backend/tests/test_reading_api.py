@@ -34,8 +34,33 @@ def estimate(client, paper, **options):
     return response.json()
 
 
-def start(client, paper, quote, limit=5):
+def start(client, paper, quote, limit=10):
     return client.post(f"/api/papers/{paper['id']}/reading/jobs", json={"quote_id": quote["quote_id"], "max_cost_cny": limit})
+
+
+@pytest.fixture
+def legacy_reading_client(reading_client, monkeypatch):
+    """Persist a v5-shaped frozen plan to exercise real legacy resume/revalidation paths."""
+    from backend.reading_api import STAGE_PROMPTS
+    client, reader = reading_client
+
+    def legacy_plan(snapshot, selection):
+        pages = snapshot["pages"]
+        groups = [("index", pages), *(("detail", pages[start:start + 3]) for start in range(0, len(pages), 3)), ("review", pages)]
+        result = []
+        for kind, group in groups:
+            stage = {"kind": kind, "label": f"旧版 {kind}", "first": group[0]["page"], "last": group[-1]["page"],
+                     "system": "Frozen legacy exact-quote JSON protocol. " + STAGE_PROMPTS[kind],
+                     "context_limit": 0 if kind == "index" else 16000 if kind == "review" else 8000,
+                     "max_tokens": {"index": 8192, "detail": 16384, "review": 12288}[kind],
+                     "base": {"title": snapshot["title"], "user_focus": selection.focus,
+                              "valid_pdf_pages": [group[0]["page"], group[-1]["page"]], "paper_source_data": group}}
+            stage.update(reader.cost(stage, selection.model))
+            result.append(stage)
+        return result
+
+    monkeypatch.setattr(reader, "plan", legacy_plan)
+    return client, reader
 
 
 def wait(client, job_id):
@@ -53,8 +78,13 @@ def wait(client, job_id):
 def provider(*args):
     user = json.loads(args[2])
     first, last = user["valid_pdf_pages"]
+    kind = user.get("stage_kind", "method")
+    kind = "guide" if kind in {"index", "review"} else kind
+    evidence = []
+    if user.get("paper_source_data") and "passages" in user["paper_source_data"][0]:
+        evidence = [{"source_id": user["paper_source_data"][0]["passages"][0]["source_id"], "label": "Source"}]
     document = {"schema_version": 1, "notes": [{"title": "模型条件与证据", "page_start": first, "page_end": last,
-        "kind": "method", "content": f"[p. {first}] 论文原文结论：\n\n" + "解释模型假设、变量单位、条件约束、推导步骤及证据边界，不虚构实验数据。" * 12,
+        "kind": kind, "evidence": evidence, "content": f"[p. {first}] 论文原文结论：\n\n" + "解释模型假设、变量单位、条件约束、推导步骤及证据边界，不虚构实验数据。" * 12,
         "sort_order": 0, "completed": True}]}
     return {"choices": [{"finish_reason": "stop", "message": {"content": json.dumps(document, ensure_ascii=False)}}],
             "usage": {"prompt_tokens": 200, "completion_tokens": 300, "prompt_cache_hit_tokens": 50}}
@@ -65,8 +95,8 @@ def test_free_estimate_stages_frozen_selection_and_no_key_or_files_in_quote(read
     paper = upload(client)
     reader.call_provider = lambda *args: pytest.fail("Preparing/estimating must be free")
     quote = estimate(client, paper, model="deepseek-v4-pro", reasoning_effort="low")
-    assert [stage["kind"] for stage in quote["stages"]] == ["index", "detail", "detail", "review"]
-    assert [(stage["first"], stage["last"]) for stage in quote["stages"] if stage["kind"] == "detail"] == [(1, 3), (4, 5)]
+    assert [stage["kind"] for stage in quote["stages"]] == ["index", "concept", "method", "experiment", "review"]
+    assert [(stage["first"], stage["last"]) for stage in quote["stages"]] == [(1, 5)] * 5
     assert quote["upper_bound_cny"] > quote["estimated_cny"] > 0
     assert quote["model"] == "deepseek-v4-pro" and quote["reasoning_effort"] == "low"
     assert "sk-reading-test-only" not in json.dumps(quote)
@@ -86,30 +116,30 @@ def test_complete_draft_is_not_auto_imported_append_preserves_old_notes_and_is_i
     assert result.status_code == 202, result.text
     job = wait(client, result.json()["id"])
     assert job["status"] == "completed", job
-    assert job["completed_stages"] == job["total_stages"] == 4
-    assert job["notes_count"] == len(calls) == 4
+    assert job["completed_stages"] == job["total_stages"] == 5
+    assert job["notes_count"] == len(calls) == 5
     assert all(note["completed"] is False and note["content"].startswith("> API 精读草稿") for note in job["notes"])
-    assert [note["sort_order"] for note in job["notes"]] == list(range(4))
+    assert [note["sort_order"] for note in job["notes"]] == list(range(5))
     assert len(client.get(f"/api/papers/{paper['id']}").json()["notes"]) == 1
     assert start(client, paper, quote).json()["id"] == job["id"]
-    assert len(calls) == 4
+    assert len(calls) == 5
     assert "prior_draft_context" in json.loads(calls[1][2])
     assert json.loads(calls[1][2])["prior_draft_context"]
     assert "UNTRUSTED" in calls[0][1]
     assert "sk-reading-test-only" not in json.dumps(job)
     exported = client.get(f"/api/reading/jobs/{job['id']}/export").json()
     assert set(exported) == {"schema_version", "notes"}
-    assert len(exported["notes"]) == 4
+    assert len(exported["notes"]) == 5
     assert "[p." in client.get(f"/api/reading/jobs/{job['id']}/export?format=markdown").text
     for _ in range(2):
         appended = client.post(f"/api/reading/jobs/{job['id']}/import")
         assert appended.status_code == 200, appended.text
-        assert len(appended.json()["paper"]["notes"]) == 5
+        assert len(appended.json()["paper"]["notes"]) == 6
         assert appended.json()["job"]["imported_at"]
     saved = client.get(f"/api/papers/{paper['id']}").json()["notes"]
     assert next(note for note in saved if note["id"] == original["id"])["content"] == original["content"]
     assert reader.ai.settings()["reserved_cny"] == 0
-    assert reader.ai.settings()["spent_cny"] == pytest.approx(4 * .002702)
+    assert reader.ai.settings()["spent_cny"] == pytest.approx(5 * .002702)
     assert client.get(f"/api/papers/{paper['id']}/translations").json()["job"] is None
 
 
@@ -305,8 +335,8 @@ def test_provider_uses_json_mode_selected_model_and_fixed_api(monkeypatch, effor
 
 
 @pytest.mark.parametrize("effort,limits", [
-    ("none", [8192, 16384, 16384, 12288]),
-    ("low", [32768] * 4), ("high", [65536] * 4), ("max", [131072] * 4),
+    ("none", [65536] * 5),
+    ("low", [65536] * 5), ("high", [131072] * 5), ("max", [262144] * 5),
 ])
 def test_reading_limits_reserve_combined_reasoning_and_json_and_are_quoted(reading_client, effort, limits):
     client, reader = reading_client
@@ -318,6 +348,64 @@ def test_reading_limits_reserve_combined_reasoning_and_json_and_are_quoted(readi
     if effort == "high":
         assert start(client, paper, quote, limit=.5).status_code == 422
     assert reader.ai.settings()["spent_cny"] == 0
+
+
+@pytest.mark.parametrize("cap", [4095, 393217, 0, -1, True, 65536.0, "65536", "", "65536.5"])
+def test_invalid_output_caps_are_rejected_before_estimation_or_dispatch(reading_client, cap):
+    client, reader = reading_client
+    paper = upload(client)
+    reader.call_provider = lambda *_: pytest.fail("Invalid caps must never call the provider")
+    assert client.post(f"/api/papers/{paper['id']}/reading/estimate", json={"max_output_tokens": cap}).status_code == 422
+    with reader.store.connection() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM translation_quotes").fetchone()[0] == 0
+    assert reader.ai.settings()["spent_cny"] == 0
+
+
+@pytest.mark.parametrize("cap", [4096, 32768, 98304, 393216])
+@pytest.mark.parametrize("effort", ["none", "max"])
+def test_explicit_output_cap_is_uniform_and_accurately_repriced_for_free(reading_client, cap, effort):
+    client, reader = reading_client
+    paper = upload(client)
+    reader.call_provider = lambda *_: pytest.fail("Estimation is free")
+    base = estimate(client, paper, reasoning_effort=effort, max_output_tokens=4096)
+    quote = estimate(client, paper, reasoning_effort=effort, max_output_tokens=cap)
+    assert quote["max_output_tokens"] == quote["requested_max_output_tokens"] == cap
+    assert [stage["max_tokens"] for stage in quote["stages"]] == [cap] * 5
+    assert quote["upper_bound_cny"] - base["upper_bound_cny"] == pytest.approx(5 * (cap - 4096) * 8 / 1e6)
+    assert reader.ai.settings()["spent_cny"] == 0
+
+
+def test_selected_output_cap_is_used_in_every_paid_request_without_fallback(reading_client):
+    client, reader = reading_client
+    paper = upload(client)
+    calls = []
+    reader.call_provider = lambda *args: calls.append(args) or provider(*args)
+    quote = estimate(client, paper, max_output_tokens=32768)
+    job = wait(client, start(client, paper, quote).json()["id"])
+    assert job["status"] == "completed"
+    assert [call[3] for call in calls] == [32768] * 5
+    assert [stage["max_tokens"] for stage in job["stages"]] == [32768] * 5
+
+
+def test_input_plus_selected_output_cannot_exceed_context_before_dispatch(reading_client, monkeypatch):
+    from backend import reading_api
+    client, reader = reading_client
+    paper = upload(client)
+    reader.call_provider = lambda *_: pytest.fail("Context guard must run before provider")
+    monkeypatch.setattr(reading_api, "MODEL_CONTEXT_TOKENS", 90000)
+    response = client.post(f"/api/papers/{paper['id']}/reading/estimate", json={"max_output_tokens": 131072})
+    assert response.status_code == 422 and "上下文" in response.text
+    assert reader.ai.settings()["spent_cny"] == 0
+
+
+@pytest.mark.parametrize("cap,timeout", [(65536, 600), (131072, 900), (262144, 1800), (393216, 1800)])
+def test_large_output_caps_allow_longer_provider_timeout_without_retry(monkeypatch, cap, timeout):
+    from backend import reading_api
+    calls = []
+    monkeypatch.setattr(reading_api, "call_chat", lambda *args, **kwargs: calls.append((args, kwargs)))
+    call_reading("sk-test-only", "system", "user", cap, "deepseek-flash", "none")
+    assert len(calls) == 1
+    assert calls[0][0][3] == cap and calls[0][1] == {"json_mode": True, "timeout": timeout}
 
 
 def test_high_reasoning_avoids_old_index_cap_without_weakening_later_analysis(reading_client):
@@ -334,11 +422,12 @@ def test_high_reasoning_avoids_old_index_cap_without_weakening_later_analysis(re
         return result
 
     reader.call_provider = needs_space
+    client.patch("/api/translation/settings", json={"total_budget_cny": 20})
     quote = estimate(client, paper, reasoning_effort="high")
     value = wait(client, start(client, paper, quote).json()["id"])
     assert value["status"] == "completed", value
-    assert len(calls) == value["completed_stages"] == 6
-    assert all(args[3] == 65536 and args[5] == "high" for args in calls)
+    assert len(calls) == value["completed_stages"] == 5
+    assert all(args[3] == 131072 and args[5] == "high" for args in calls)
     assert "ONLY the navigation/index stage" in calls[0][1]
     assert "exactly TWO guide notes" in calls[0][1]
     assert "in depth" in calls[1][1]
@@ -367,12 +456,13 @@ def test_truncation_records_safe_diagnostics_and_keeps_prior_valid_draft(reading
     value = wait(client, start(client, paper, quote).json()["id"])
     assert value["status"] == "failed" and value["completed_stages"] == value["notes_count"] == 1
     assert len(calls) == 2
-    assert "第 2 阶段" in value["error"] and "16,384/16,384" in value["error"]
+    assert "第 2 阶段" in value["error"] and "65,536/65,536" in value["error"]
+    assert "已关闭推理" in value["error"] and "含推理" not in value["error"]
     assert "未自动重试" in value["error"]
     attempt = value["last_attempt"]
     assert attempt["stage"] == 2 and attempt["label"] == quote["stages"][1]["label"]
     assert attempt["finish_reason"] == "length"
-    assert attempt["max_tokens"] == attempt["output_tokens"] == 16384
+    assert attempt["max_tokens"] == attempt["output_tokens"] == 65536
     assert attempt["reasoning_tokens"] == (12000 if type(reasoning) is int and reasoning == 12000 else None)
     assert attempt["content_characters"] > 0
     assert value["cost_cny"] > .1 and reader.ai.settings()["reserved_cny"] == 0
@@ -516,11 +606,11 @@ def test_provider_markdown_newlines_complete_without_extra_calls(reading_client)
 
     reader.call_provider = multiline
     value = wait(client, start(client, paper, estimate(client, paper)).json()["id"])
-    assert value["status"] == "completed" and value["completed_stages"] == len(calls) == 4
+    assert value["status"] == "completed" and value["completed_stages"] == len(calls) == 5
     assert value["last_attempt"]["normalizations"] == ["json_string_whitespace"]
     assert value["has_rejected_output"] is False
     assert client.get(f"/api/reading/jobs/{value['id']}/rejected-output").status_code == 404
-    assert reader.ai.settings()["spent_cny"] == pytest.approx(4 * .002702)
+    assert reader.ai.settings()["spent_cny"] == pytest.approx(5 * .002702)
 
 
 def test_rejected_final_text_is_retained_without_reasoning_and_deleted_with_paper(reading_client):
@@ -533,18 +623,18 @@ def test_rejected_final_text_is_retained_without_reasoning_and_deleted_with_pape
         result = provider(*args)
         if len(calls) == 2:
             value = json.loads(result["choices"][0]["message"]["content"])
-            value["notes"][0]["page_start"] = 4
-            value["notes"][0]["page_end"] = 5
+            value["notes"][0]["page_start"] = 6
+            value["notes"][0]["page_end"] = 7
             result["choices"][0]["message"] = {"content": json.dumps(value), "reasoning_content": "DO NOT SAVE PRIVATE REASONING"}
         return result
 
     reader.call_provider = invalid_page
     value = wait(client, start(client, paper, estimate(client, paper)).json()["id"])
     assert value["status"] == "failed" and value["notes_count"] == 1 and len(calls) == 2
-    assert "页码 4–5" in value["error"] and "第 1–3 页" in value["error"]
+    assert "页码 6–7" in value["error"] and "第 1–5 页" in value["error"]
     assert value["last_attempt"]["validation_error"]["code"] == "page_range"
     raw = client.get(f"/api/reading/jobs/{value['id']}/rejected-output").text
-    assert json.loads(raw)["notes"][0]["page_start"] == 4
+    assert json.loads(raw)["notes"][0]["page_start"] == 6
     assert "DO NOT SAVE" not in raw and "DO NOT SAVE" not in json.dumps(value)
     assert "rejected_output" not in value
     assert client.delete(f"/api/papers/{paper['id']}").status_code == 204
@@ -627,8 +717,8 @@ def test_resume_quotes_and_dispatches_only_remaining_stages_preserves_drafts_and
     assert quote_response.status_code == 200, quote_response.text
     quote = quote_response.json()
     assert quote["resume_job_id"] == job["id"] and quote["completed_stages"] == 1
-    assert quote["total_stages"] == 4 and quote["remaining_stages"] == 3
-    assert [stage["stage_number"] for stage in quote["stages"]] == [2, 3, 4]
+    assert quote["total_stages"] == 5 and quote["remaining_stages"] == 4
+    assert [stage["stage_number"] for stage in quote["stages"]] == [2, 3, 4, 5]
     assert quote["upper_bound_cny"] == pytest.approx(sum(stage["upper_bound_cny"] for stage in original_quote["stages"][1:]))
     assert len(calls) == 2 and reader.ai.settings()["spent_cny"] == spent
     payload = {"quote_id": quote["quote_id"], "max_cost_cny": 5}
@@ -636,26 +726,27 @@ def test_resume_quotes_and_dispatches_only_remaining_stages_preserves_drafts_and
     assert result.status_code == 202 and result.json()["id"] == job["id"]
     complete = wait(client, job["id"])
     assert complete["status"] == "completed", complete
-    assert complete["completed_stages"] == complete["notes_count"] == 4 and len(calls) == 5
-    assert sum(json.loads(call[2])["valid_pdf_pages"] == [1, 3] for call in calls) == 2
+    assert complete["completed_stages"] == complete["notes_count"] == 5 and len(calls) == 6
+    assert sum(json.loads(call[2])["stage_kind"] == "concept" for call in calls) == 2
+    assert all(json.loads(call[2])["valid_pdf_pages"] == [1, 5] for call in calls)
     assert any(note["content"] == job["notes"][0]["content"] for note in complete["notes"])
     assert complete["can_resume"] is False and complete["remaining_stages"] == 0
-    assert reader.ai.settings()["spent_cny"] == pytest.approx(spent + .002702 * 3)
+    assert reader.ai.settings()["spent_cny"] == pytest.approx(spent + .002702 * 4)
     assert reader.ai.settings()["uncertain_cny"] == uncertainty
     assert reader.ai.settings()["reserved_cny"] == 0
     with reader.store.connection() as connection:
         receipts = [dict(row) for row in connection.execute("SELECT * FROM translation_receipts WHERE job_id=? ORDER BY rowid", (job["id"],))]
     assert receipts[:2] == original_receipts
-    assert [receipt["page"] for receipt in receipts] == [1, 2, 2, 3, 4]
+    assert [receipt["page"] for receipt in receipts] == [1, 2, 2, 3, 4, 5]
     # Reusing a confirmation never starts another paid attempt, even after the run finishes.
     assert client.post(f"/api/reading/jobs/{job['id']}/resume", json=payload).json()["id"] == job["id"]
-    assert len(calls) == 5
+    assert len(calls) == 6
     assert client.post(f"/api/reading/jobs/{job['id']}/resume/estimate").status_code == 409
 
 
-def test_resume_keeps_frozen_legacy_prompts_limits_model_and_uses_valid_old_notes(reading_client, monkeypatch):
+def test_resume_keeps_frozen_legacy_prompts_limits_model_and_uses_valid_old_notes(legacy_reading_client, monkeypatch):
     from backend import reading_api
-    client, reader = reading_client
+    client, reader = legacy_reading_client
     paper = upload(client)
     job, _, calls = failed_after_first_stage(client, reader, paper)
     with reader.store.connection() as connection:
@@ -678,6 +769,106 @@ def test_resume_keeps_frozen_legacy_prompts_limits_model_and_uses_valid_old_note
     assert calls[2][4:] == calls[1][4:]
     assert old[0]["content"] in {note["content"] for note in complete["notes"]}
     assert client.post(f"/api/reading/jobs/{job['id']}/import").status_code == 200
+
+
+def test_resume_higher_cap_only_updates_unfinished_plan_after_budget_confirmation(reading_client):
+    client, reader = reading_client
+    paper = upload(client)
+    calls = []
+
+    def fail_at_old_cap(*args):
+        calls.append(args)
+        value = provider(*args)
+        if len(calls) == 2:
+            value["choices"][0] = {"finish_reason": "length", "message": {"content": '{"notes":['}}
+            value["usage"]["completion_tokens"] = args[3]
+        return value
+
+    reader.call_provider = fail_at_old_cap
+    job = wait(client, start(client, paper, estimate(client, paper, max_output_tokens=16384)).json()["id"])
+    assert job["completed_stages"] == 1 and job["last_attempt"]["max_tokens"] == 16384
+    with reader.store.connection() as connection:
+        saved_run = dict(connection.execute("SELECT * FROM reading_runs WHERE id=?", (job["id"],)).fetchone())
+        saved_receipts = [dict(row) for row in connection.execute("SELECT * FROM translation_receipts")]
+    spent = reader.ai.settings()["spent_cny"]
+    path = f"/api/reading/jobs/{job['id']}/resume"
+    old_quote = client.post(path + "/estimate").json()
+    response = client.post(path + "/estimate", json={"max_output_tokens": 65536})
+    assert response.status_code == 200, response.text
+    quote = response.json()
+    assert quote["output_limit_changed"] and quote["requested_max_output_tokens"] == 65536
+    assert quote["previous_output_limits"] == [16384] * 4
+    assert [stage["max_tokens"] for stage in quote["stages"]] == [65536] * 4
+    assert quote["upper_bound_cny"] - old_quote["upper_bound_cny"] == pytest.approx(4 * (65536 - 16384) * 8 / 1e6)
+    with reader.store.connection() as connection:
+        assert dict(connection.execute("SELECT * FROM reading_runs WHERE id=?", (job["id"],)).fetchone()) == saved_run
+        assert [dict(row) for row in connection.execute("SELECT * FROM translation_receipts")] == saved_receipts
+    payload = {"quote_id": quote["quote_id"], "max_cost_cny": 0}
+    assert client.post(path, json=payload).status_code == 422
+    with reader.store.connection() as connection:
+        assert dict(connection.execute("SELECT * FROM reading_runs WHERE id=?", (job["id"],)).fetchone()) == saved_run
+    assert len(calls) == 2 and reader.ai.settings()["spent_cny"] == spent
+    payload["max_cost_cny"] = 5
+    assert client.post(path, json=payload).status_code == 202
+    complete = wait(client, job["id"])
+    assert complete["status"] == "completed" and complete["completed_stages"] == 5
+    assert [stage["max_tokens"] for stage in complete["stages"]] == [16384] + [65536] * 4
+    assert [call[3] for call in calls] == [16384, 16384] + [65536] * 4
+    assert calls[2][1:3] == calls[1][1:3] and calls[2][4:] == calls[1][4:]
+    assert any(note["content"] == job["notes"][0]["content"] for note in complete["notes"])
+    with reader.store.connection() as connection:
+        plan = json.loads(connection.execute("SELECT plan FROM reading_runs WHERE id=?", (job["id"],)).fetchone()[0])
+        diagnostics = json.loads(connection.execute("SELECT diagnostics FROM reading_runs WHERE id=?", (job["id"],)).fetchone()[0])
+        receipts = [dict(row) for row in connection.execute("SELECT * FROM translation_receipts")]
+    original_plan = json.loads(saved_run["plan"])
+    assert plan[0] == original_plan[0]
+    assert diagnostics[1]["max_tokens"] == 16384 and diagnostics[2]["max_tokens"] == 65536
+    for previous, current in zip(original_plan[1:], plan[1:]):
+        assert {key: value for key, value in previous.items() if key not in {"max_tokens", "estimated_cny", "upper_bound_cny"}} == {
+            key: value for key, value in current.items() if key not in {"max_tokens", "estimated_cny", "upper_bound_cny"}}
+    assert receipts[:2] == saved_receipts and len(receipts) == 6
+    assert reader.ai.settings()["spent_cny"] == pytest.approx(spent + .002702 * 4)
+    assert client.post(path, json=payload).status_code == 202 and len(calls) == 6
+    # The other pre-adjustment estimate is stale, even if the task is later made resumable again.
+    with reader.store.connection() as connection:
+        connection.execute("UPDATE translation_jobs SET status='failed' WHERE id=?", (job["id"],))
+        connection.execute("UPDATE translation_jobs SET completed_pages=1 WHERE id=?", (job["id"],))
+    stale = client.post(path, json={"quote_id": old_quote["quote_id"], "max_cost_cny": 5})
+    assert stale.status_code == 409 and len(calls) == 6
+
+
+@pytest.mark.parametrize("body", [{"max_output_tokens": 393217}, {"max_output_tokens": True}, {"max_output_tokens": "65536"},
+                                 {"max_output_tokens": 4095}, {"max_output_tokens": 65536.0}, {"model": "deepseek-v4-pro"},
+                                 {"reasoning_effort": "high"}])
+def test_resume_rejects_invalid_caps_or_configuration_changes_without_mutation(reading_client, body):
+    client, reader = reading_client
+    paper = upload(client)
+    job, _, calls = failed_after_first_stage(client, reader, paper)
+    with reader.store.connection() as connection:
+        saved = dict(connection.execute("SELECT * FROM reading_runs WHERE id=?", (job["id"],)).fetchone())
+        quotes = connection.execute("SELECT COUNT(*) FROM translation_quotes").fetchone()[0]
+    assert client.post(f"/api/reading/jobs/{job['id']}/resume/estimate", json=body).status_code == 422
+    with reader.store.connection() as connection:
+        assert dict(connection.execute("SELECT * FROM reading_runs WHERE id=?", (job["id"],)).fetchone()) == saved
+        assert connection.execute("SELECT COUNT(*) FROM translation_quotes").fetchone()[0] == quotes
+    assert len(calls) == 2
+
+
+def test_resume_higher_cap_keeps_legacy_workflow_and_frozen_prompts(legacy_reading_client):
+    client, reader = legacy_reading_client
+    paper = upload(client)
+    job, _, calls = failed_after_first_stage(client, reader, paper)
+    path = f"/api/reading/jobs/{job['id']}/resume"
+    preserved = client.post(path + "/estimate", json={}).json()
+    assert preserved["requested_max_output_tokens"] is None and not preserved["output_limit_changed"]
+    assert [stage["max_tokens"] for stage in preserved["stages"]] == [16384, 16384, 12288]
+    quote = client.post(path + "/estimate", json={"max_output_tokens": 65536}).json()
+    assert quote["workflow"] == "legacy-page-batches" and quote["previous_output_limits"] == [16384, 16384, 12288]
+    assert client.post(path, json={"quote_id": quote["quote_id"], "max_cost_cny": 5}).status_code == 202
+    complete = wait(client, job["id"])
+    assert complete["status"] == "completed" and complete["completed_stages"] == 4
+    assert calls[2][1:3] == calls[1][1:3] and calls[2][3] == 65536
+    assert complete["stages"][0]["max_tokens"] == 8192
 
 
 @pytest.mark.parametrize("mutation", ["source", "key", "expired", "notes", "prices"])
@@ -787,8 +978,10 @@ def test_final_synthesis_precedes_guides_and_detail_categories(reading_client):
         if len(calls) == 1:
             value["notes"] = [{**template, "title": "初读概要", "kind": "guide"}]
         elif len(calls) == 2:
-            value["notes"] = [{**template, "title": "方法", "kind": "method"}, {**template, "title": "概念", "kind": "concept"}]
+            value["notes"] = [{**template, "title": "概念", "kind": "concept"}]
         elif len(calls) == 3:
+            value["notes"] = [{**template, "title": "方法", "kind": "method"}]
+        elif len(calls) == 4:
             value["notes"] = [{**template, "title": "实验", "kind": "experiment"}]
         else:
             value["notes"] = [{**template, "title": "整篇总结", "kind": "guide"}, {**template, "title": "证据局限", "kind": "critique"}]
@@ -803,7 +996,7 @@ def test_final_synthesis_precedes_guides_and_detail_categories(reading_client):
     digest = json.loads(calls[-1][2])["prior_draft_context"]
     assert all(title in digest for title in ("初读概要", "方法", "概念", "实验"))
     assert "Do not mix method and experiment" in calls[1][1]
-    assert "整篇总结：问题、方法与实验证据" in calls[-1][1]
+    assert "整篇学习总结：问题、方法与实验" in calls[-1][1]
     response = client.post(f"/api/reading/jobs/{job['id']}/import")
     assert [note["title"] for note in response.json()["paper"]["notes"]] == [note["title"] for note in job["notes"]]
 
@@ -857,8 +1050,8 @@ def test_evidence_layout_is_aligned_without_changing_note_body_or_claiming_verif
     assert "evidence_layout_aligned" in normalizations
 
 
-def test_free_revalidation_recovers_saved_complete_stage_once_without_provider_or_new_receipts(reading_client):
-    client, reader = reading_client
+def test_free_revalidation_recovers_saved_complete_stage_once_without_provider_or_new_receipts(legacy_reading_client):
+    client, reader = legacy_reading_client
     paper = upload(client)
     quote = estimate(client, paper)
     reader.call_provider = provider
@@ -891,8 +1084,8 @@ def test_free_revalidation_recovers_saved_complete_stage_once_without_provider_o
 
 
 @pytest.mark.parametrize("failure,expected", [("fabricated", 422), ("json", 422), ("truncated", 409), ("source", 409), ("active", 409), ("imported", 409), ("missing", 409)])
-def test_free_revalidation_rejects_unsafe_or_stale_results_without_mutation(reading_client, monkeypatch, failure, expected):
-    client, reader = reading_client
+def test_free_revalidation_rejects_unsafe_or_stale_results_without_mutation(legacy_reading_client, monkeypatch, failure, expected):
+    client, reader = legacy_reading_client
     paper = upload(client)
     reader.call_provider = provider
     job = wait(client, start(client, paper, estimate(client, paper)).json()["id"])

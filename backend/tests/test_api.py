@@ -344,6 +344,7 @@ def test_reading_task_is_single_paper_read_only_and_free(client, monkeypatch):
     assert value["mode"] == "assistant-assisted"
     assert value["status"] == "prepared"
     assert value["calls_external_api"] is False
+    assert value["reading_style"] == "learning-tutor-v1"
     text = value["request"]
     assert "Only this paper" in text
     assert "Another unrelated paper" not in text
@@ -351,6 +352,8 @@ def test_reading_task_is_single_paper_read_only_and_free(client, monkeypatch):
     assert "Check queue assumptions" in text
     assert "sk-must-not-appear" not in text
     for requirement in ("不包含自测", "原文", "单位", "算法", "图表", "局限", "待核验", "replace", "schema_version"):
+        assert requirement in text
+    for requirement in ("学习导师", "教学构造，非论文实验", "拉格朗日", "公式逐步推导", "图表未读取", "至多一条"):
         assert requirement in text
     assert client.get(f"/api/papers/{paper['id']}").json()["notes"] == [note]
     with client.app.state.store.connection() as connection:
