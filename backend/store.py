@@ -61,6 +61,17 @@ class Store:
                     PRIMARY KEY (paper_id, category_id)
                 );
                 CREATE INDEX IF NOT EXISTS paper_categories_category ON paper_categories(category_id, paper_id);
+                CREATE TABLE IF NOT EXISTS annotations (
+                    id TEXT PRIMARY KEY,
+                    paper_id TEXT NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
+                    page INTEGER NOT NULL CHECK(page > 0),
+                    quote TEXT NOT NULL,
+                    rects TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS annotations_paper_page ON annotations(paper_id, page);
                 """
             )
             if "doi" not in {row["name"] for row in connection.execute("PRAGMA table_info(papers)")}:
@@ -153,6 +164,9 @@ class Store:
                     "SELECT category_id FROM paper_categories WHERE paper_id=? ORDER BY category_id", (paper_id,)
                 )]
             if paper is not None and detail:
+                paper["annotations"] = [self.annotation_dict(item) for item in connection.execute(
+                    "SELECT * FROM annotations WHERE paper_id=? ORDER BY page,rowid", (paper_id,)
+                )]
                 paper["notes"] = [self.note_dict(note) for note in connection.execute(
                     "SELECT * FROM notes WHERE paper_id=? AND deleted_at IS NULL ORDER BY sort_order, rowid", (paper_id,)
                 ).fetchall()]
@@ -171,6 +185,52 @@ class Store:
     def seed_is_deleted(self, paper_id: str):
         with self.connection() as connection:
             return connection.execute("SELECT 1 FROM deleted_seeds WHERE id=?", (paper_id,)).fetchone() is not None
+
+    @staticmethod
+    def annotation_dict(row):
+        result = dict(row)
+        result.pop("paper_id", None)
+        result["rects"] = json.loads(result["rects"])
+        return result
+
+    @staticmethod
+    def insert_annotation(connection, paper_id, value):
+        annotation_id = uuid.uuid4().hex
+        connection.execute(
+            "INSERT INTO annotations(id,paper_id,page,quote,rects,content) VALUES (?,?,?,?,?,?)",
+            (annotation_id, paper_id, value["page"], value["quote"], json.dumps(value["rects"]), value["content"]),
+        )
+        return annotation_id
+
+    def create_annotation(self, paper_id, value):
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            paper = connection.execute("SELECT page_count FROM papers WHERE id=? AND deleted_at IS NULL", (paper_id,)).fetchone()
+            if paper is None:
+                return None
+            if value["page"] > paper["page_count"]:
+                raise ValueError("Annotation page is outside its PDF")
+            annotation_id = self.insert_annotation(connection, paper_id, value)
+            return self.annotation_dict(connection.execute("SELECT * FROM annotations WHERE id=?", (annotation_id,)).fetchone())
+
+    def edit_annotation(self, paper_id, annotation_id, content):
+        with self.connection() as connection:
+            cursor = connection.execute(
+                "UPDATE annotations SET content=?,updated_at=CURRENT_TIMESTAMP WHERE paper_id=? AND id=? "
+                "AND EXISTS (SELECT 1 FROM papers WHERE id=? AND deleted_at IS NULL)",
+                (content, paper_id, annotation_id, paper_id),
+            )
+            if not cursor.rowcount:
+                return None
+            return self.annotation_dict(connection.execute("SELECT * FROM annotations WHERE id=?", (annotation_id,)).fetchone())
+
+    def delete_annotation(self, paper_id, annotation_id):
+        with self.connection() as connection:
+            return bool(connection.execute(
+                "DELETE FROM annotations WHERE paper_id=? AND id=? "
+                "AND EXISTS (SELECT 1 FROM papers WHERE id=? AND deleted_at IS NULL)",
+                (paper_id, annotation_id, paper_id),
+            ).rowcount)
 
     def create_paper(self, metadata, path: Path, page_count: int, file_name: str, managed: bool, paper_id=None, notes=None, category_ids=None):
         paper_id = paper_id or uuid.uuid4().hex

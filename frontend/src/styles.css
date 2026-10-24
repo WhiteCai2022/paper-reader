@@ -234,6 +234,26 @@ svg { flex: 0 0 auto; }
 .pdf-source-highlights { position: absolute; inset: 0; z-index: 2; pointer-events: none; overflow: hidden; }
 .pdf-source-highlights > span { position: absolute; background: #f6c64766; box-shadow: 0 0 0 1px #dca71438; border-radius: 2px; }
 .pdf-source-highlights.whole-page-reference { box-shadow: inset 0 0 0 3px #d3ad49; background: #f6c6470a; }
+.pdf-annotation-highlights, .pdf-annotation-highlights > div { position: absolute; inset: 0; pointer-events: none; z-index: 2; }
+.pdf-annotation-highlights span { position: absolute; background: #8ad3ca55; box-shadow: 0 1px 0 #3b9e9670; }
+.pdf-annotation-highlights .active span { background: #5ec8bb77; box-shadow: 0 0 0 1px #258c83a0; }
+.pdf-annotation-marker { position: absolute; right: 3px; width: 26px; height: 26px; padding: 0; display: grid; place-items: center; pointer-events: auto; border: 1px solid #79ada6; border-radius: 4px; color: #176b62; background: #edf9f6; }
+.pdf-annotation-marker:hover, .active > .pdf-annotation-marker { background: #cef0e7; border-color: #258c83; }
+.pdf-selection-action { position: fixed; z-index: 20; background: #176b62; color: white; border-color: #176b62; height: 34px; min-width: 80px; box-shadow: 0 3px 12px #123a322b; }
+.pdf-selection-action:hover { background: #12574f; color: white; }
+.annotations-scroll { flex: 1; min-height: 0; overflow: auto; }
+.annotation-item { padding: 15px 20px; border-bottom: 1px solid var(--border); border-left: 3px solid transparent; }
+.annotation-item.active { background: #f1f9f7; border-left-color: #258c83; }
+.annotation-item > header { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
+.annotation-quote { display: block; width: 100%; text-align: left; border: 0; border-left: 2px solid #8bbeb5; border-radius: 0; padding: 6px 10px; color: #60726e; background: #eff5f3; font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; max-height: 150px; overflow: auto; white-space: pre-wrap; }
+.annotation-quote:hover { color: #176b62; background: #e5f2ed; }
+.annotation-content { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.8; font-size: 14px; margin: 12px 0 0; }
+.annotation-editor { width: min(580px, 100%); }
+.annotation-source { margin-bottom: 14px; }
+.annotation-source > span { font-size: 12px; color: #60726e; }
+.annotation-source blockquote { margin: 8px 0 0; padding: 8px 12px; border-left: 2px solid #8bbeb5; background: #eff5f3; max-height: 130px; overflow: auto; font-size: 12px; line-height: 1.7; white-space: pre-wrap; overflow-wrap: anywhere; }
+.annotation-editor textarea { width: 100%; min-height: 140px; max-height: 35dvh; resize: vertical; line-height: 1.7; }
+.annotation-discard { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 12px; font-size: 12px; color: #994e40; }
 .pdf-alignment-status { position: sticky; bottom: 10px; margin: 8px auto; width: fit-content; max-width: 90%; padding: 6px 10px; border: 1px solid #d9b967; border-radius: 4px; background: #fff9e6; color: #795d25; font-size: 11px; z-index: 3; pointer-events: none; }
 .page-loading { position: absolute; inset: 0; display: flex; align-items: flex-start; justify-content: center; padding-top: 80px; color: #7a997f; pointer-events: none; }
 .page-caption { text-align: center; color: #94a38e; font-size: 10px; line-height: 24px; padding-top: 10px; font-variant-numeric: tabular-nums; }

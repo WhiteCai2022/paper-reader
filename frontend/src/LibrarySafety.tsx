@@ -6,6 +6,7 @@ import { Modal } from './Dialogs';
 interface TrashItem { type: 'paper' | 'note'; id: string; title: string; paper_id?: string; paper_title?: string; deleted_at: string }
 interface RestorePreview {
   preview_id: string; papers_count: number; notes_count: number; pdfs_count: number;
+  annotations_count?: number;
   missing_pdfs: number | string[]; warnings: string[];
 }
 interface EmptyTrashPreview {
@@ -96,9 +97,9 @@ export function LibrarySafetyDialog({ onClose, onRestored }: { onClose: () => vo
   async function restoreBackup() {
     if (!preview || !confirmed) return; setBusy(true); setError(''); setNotice('');
     try {
-      const result = await api<{ papers_count: number; notes_count: number }>('/api/library/restore', { method: 'POST', body: JSON.stringify({ preview_id: preview.preview_id, confirm: true }) });
+      const result = await api<{ papers_count: number; notes_count: number; annotations_count?: number }>('/api/library/restore', { method: 'POST', body: JSON.stringify({ preview_id: preview.preview_id, confirm: true }) });
       setPreview(null); setConfirmed(false); setFile(null);
-      await onRestored(); setNotice(`已合并恢复 ${result.papers_count} 篇文献、${result.notes_count} 条解析。现有文献和费用账本未覆盖。`);
+      await onRestored(); setNotice(`已合并恢复 ${result.papers_count} 篇文献、${result.notes_count} 条解析、${result.annotations_count || 0} 条批注。现有文献和费用账本未覆盖。`);
     } catch (failure) { setError(messageOf(failure)); } finally { setBusy(false); }
   }
   async function restoreItem(item: TrashItem) {
@@ -113,11 +114,11 @@ export function LibrarySafetyDialog({ onClose, onRestored }: { onClose: () => vo
     <div className="library-safety-tabs segmented"><button aria-pressed={tab === 'backup'} className={tab === 'backup' ? 'active' : ''} disabled={busy} onClick={() => changeTab('backup')}><ShieldCheck size={15} />备份与恢复</button><button aria-pressed={tab === 'trash'} className={tab === 'trash' ? 'active' : ''} disabled={busy} onClick={() => changeTab('trash')}><Trash2 size={15} />回收站</button></div>
     <div className="dialog-form library-safety-scroll">
       {tab === 'backup' ? <>
-        <section className="library-safety-section"><h3><FileArchive size={17} />文献库备份</h3><p className="muted">PDF、解析、分类、阅读进度和译文；数据库与历史任务存档，不包含 API Key。</p><button className="button" disabled={busy} onClick={() => void backup()}>{busy ? <LoaderCircle className="spin" size={15} /> : <Download size={15} />}下载完整备份</button></section>
+        <section className="library-safety-section"><h3><FileArchive size={17} />文献库备份</h3><p className="muted">PDF、解析、批注、分类、阅读进度和译文；数据库与历史任务存档，不包含 API Key。</p><button className="button" disabled={busy} onClick={() => void backup()}>{busy ? <LoaderCircle className="spin" size={15} /> : <Download size={15} />}下载完整备份</button></section>
         <section className="library-safety-section"><h3><ArchiveRestore size={17} />安全合并恢复</h3><p className="muted">恢复为新文献，不覆盖当前资料、费用账本或 Key。历史收费任务不会重放，未追加草稿保留在备份包的 drafts 中。</p>
           <label>备份文件<input aria-label="选择文献库备份" type="file" accept=".zip,application/zip" disabled={busy} onChange={event => { setFile(event.target.files?.[0] || null); setPreview(null); setConfirmed(false); setError(''); }} /></label>
           <button className="button" disabled={busy || !file} onClick={() => void inspect()}>{busy ? <LoaderCircle className="spin" size={15} /> : <Upload size={15} />}校验备份包</button>
-          {preview && <div className="library-restore-preview"><dl><div><dt>文献</dt><dd>{preview.papers_count}</dd></div><div><dt>解析</dt><dd>{preview.notes_count}</dd></div><div><dt>PDF</dt><dd>{preview.pdfs_count}</dd></div></dl>
+          {preview && <div className="library-restore-preview"><dl><div><dt>文献</dt><dd>{preview.papers_count}</dd></div><div><dt>解析</dt><dd>{preview.notes_count}</dd></div><div><dt>批注</dt><dd>{preview.annotations_count || 0}</dd></div><div><dt>PDF</dt><dd>{preview.pdfs_count}</dd></div></dl>
             {missing > 0 && <p className="form-warning">有 {missing} 个 PDF 未包含在备份中，恢复后需重新关联原文。</p>}
             {preview.warnings.map((warning, index) => <p className="form-warning" key={index}>{warning}</p>)}
             <label className="library-restore-confirm"><input type="checkbox" checked={confirmed} disabled={busy} onChange={event => setConfirmed(event.target.checked)} />确认合并为新文献；保留当前资料与费用记录</label>
@@ -128,7 +129,7 @@ export function LibrarySafetyDialog({ onClose, onRestored }: { onClose: () => vo
         {emptyPreview && <section className="library-trash-confirm" aria-labelledby="library-trash-confirm-heading">
           <h3 ref={emptyHeading} id="library-trash-confirm-heading" tabIndex={-1}>永久清空回收站</h3>
           <dl><div><dt>文献</dt><dd>{emptyPreview.papers_count}</dd></div><div><dt>解析</dt><dd>{emptyPreview.notes_count}</dd></div><div><dt>托管 PDF</dt><dd>{emptyPreview.pdfs_count}</dd></div></dl>
-          <p className="danger-text">将永久删除上述文献及关联资料、单独删除的解析和历史版本，不能再从回收站还原。请先确认已保存所需备份。</p>
+          <p className="danger-text">将永久删除上述文献及关联资料（含批注）、单独删除的解析和历史版本，不能再从回收站还原。请先确认已保存所需备份。</p>
           <p className="muted">未删除的文献、费用账本和 API Key 不变；已有备份不受影响。外部原始 PDF 不会删除{emptyPreview.external_pdfs_count > 0 ? `（${emptyPreview.external_pdfs_count} 个）` : ''}。</p>
           {emptyPreview.warnings.map((warning, index) => <p className="form-warning" key={index}>{warning}</p>)}
           <label className="library-restore-confirm"><input type="checkbox" aria-label="确认永久删除回收站内容" checked={emptyConfirmed} disabled={busy} onChange={event => setEmptyConfirmed(event.target.checked)} />我确认永久删除，且理解无法从回收站还原</label>

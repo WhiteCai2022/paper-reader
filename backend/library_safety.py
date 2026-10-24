@@ -18,7 +18,7 @@ from pypdf import PdfReader
 from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 
-from .models import CategoryInput, Metadata, Model, NoteCreate, Progress
+from .models import AnnotationCreate, CategoryInput, Metadata, Model, NoteCreate, Progress
 
 
 router = APIRouter(prefix="/api")
@@ -84,7 +84,7 @@ def make_backup(store, destination):
                         "database_sha256": _digest(snapshot), "api_jobs_count": 0, "unimported_reading_drafts_count": 0, "draftfiles_count": 0, "draft_files": []}
             if len(manifest["categories"]) > 10_000:
                 raise ValueError("The backup contains too many categories")
-            note_count = 0
+            note_count, annotation_count = 0, 0
             for row in connection.execute("SELECT * FROM papers ORDER BY rowid"):
                 paper = dict(row)
                 paper["tags"] = json.loads(paper["tags"])
@@ -98,6 +98,12 @@ def make_backup(store, destination):
                 if len(paper["notes"]) > 10_000 or any(len(note["versions"]) > 100_000 for note in paper["notes"]):
                     raise ValueError("The backup contains too many notes or note versions")
                 paper["category_ids"] = [item[0] for item in connection.execute("SELECT category_id FROM paper_categories WHERE paper_id=?", (paper["id"],))]
+                paper["annotations"] = [store.annotation_dict(item) for item in connection.execute("SELECT * FROM annotations WHERE paper_id=? ORDER BY page,rowid", (paper["id"],))]
+                if len(paper["annotations"]) > 10_000:
+                    raise ValueError("The backup contains too many annotations")
+                annotation_count += len(paper["annotations"])
+                if annotation_count > 100_000:
+                    raise ValueError("The backup contains too many annotations")
                 paper["translations"] = [dict(item) for item in connection.execute("SELECT * FROM translation_pages WHERE paper_id=?", (paper["id"],))] if _has_table(connection, "translation_pages") else []
                 original = Path(paper.pop("pdf_path"))
                 source = original if original.is_absolute() else store.data_dir / original
@@ -199,7 +205,7 @@ def inspect_backup(store, path, temporary):
             if not isinstance(category["id"], str) or category["id"] in category_ids:
                 raise ValueError("Invalid category identifier")
             category_ids.add(category["id"])
-        note_count, pdf_count, referenced_pdf_bytes, missing = 0, 0, 0, []
+        note_count, annotation_count, pdf_count, referenced_pdf_bytes, missing = 0, 0, 0, 0, []
         for paper in manifest["papers"]:
             # Filesystem paths are produced here, never accepted from an uploaded manifest.
             paper.pop("staged_pdf", None)
@@ -218,6 +224,15 @@ def inspect_backup(store, path, temporary):
                 raise ValueError("Reading progress is outside its PDF")
             if not isinstance(paper.get("notes"), list) or len(paper["notes"]) > 10_000:
                 raise ValueError("Invalid note list")
+            annotations = paper.get("annotations", [])
+            if not isinstance(annotations, list) or len(annotations) > 10_000:
+                raise ValueError("Invalid annotation list")
+            paper["annotations"] = [AnnotationCreate.model_validate({name: item[name] for name in AnnotationCreate.model_fields if name in item}).model_dump() for item in annotations]
+            if any(item["page"] > page_count for item in paper["annotations"]):
+                raise ValueError("Annotation page is outside its PDF")
+            annotation_count += len(annotations)
+            if annotation_count > 100_000:
+                raise ValueError("The backup contains too many annotations")
             if not isinstance(paper.get("category_ids"), list) or not set(paper["category_ids"]).issubset(category_ids):
                 raise ValueError("Invalid category membership")
             note_ids = set()
@@ -269,6 +284,7 @@ def inspect_backup(store, path, temporary):
         if duplicates:
             warnings.append(f"当前文献库已有 {duplicates} 条同名文献，确认恢复后会保留两个副本。")
         return manifest, {"papers_count": len(manifest["papers"]), "notes_count": note_count, "pdfs_count": pdf_count,
+                          "annotations_count": annotation_count,
                           "draftfiles_count": manifest.get("draftfiles_count", 0), "missing_pdfs": missing, "warnings": warnings}
 
 
@@ -298,6 +314,8 @@ def merge_restore(store, manifest):
                               page=paper.get("page", 1), zoom=paper.get("zoom", 1), deleted_at=paper.get("deleted_at"))
                 connection.execute("INSERT INTO papers(id," + ",".join(names) + ") VALUES (" + ",".join("?" for _ in range(len(names) + 1)) + ")", (paper_id, *(values[name] for name in names)))
                 note_map = {}
+                for annotation in paper.get("annotations", []):
+                    store.insert_annotation(connection, paper_id, annotation)
                 for note in paper["notes"]:
                     note_id = store.insert_note(connection, paper_id, note, note["sort_order"])
                     note_map[note["id"]] = note_id
@@ -319,7 +337,8 @@ def merge_restore(store, manifest):
                             raise ValueError("Invalid cached translation")
                         names = sorted(available & translation.keys())
                         connection.execute("INSERT OR IGNORE INTO translation_pages(paper_id," + ",".join(names) + ") VALUES (" + ",".join("?" for _ in range(len(names) + 1)) + ")", (paper_id, *(translation[name] for name in names)))
-        return {"papers_count": len(paper_ids), "notes_count": sum(len(paper["notes"]) for paper in manifest["papers"]), "paper_ids": paper_ids}
+        return {"papers_count": len(paper_ids), "notes_count": sum(len(paper["notes"]) for paper in manifest["papers"]),
+                "annotations_count": sum(len(paper.get("annotations", [])) for paper in manifest["papers"]), "paper_ids": paper_ids}
     except Exception:
         for path in created_files:
             path.unlink(missing_ok=True)

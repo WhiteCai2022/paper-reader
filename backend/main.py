@@ -29,6 +29,7 @@ from .reading_api import ReadingService, router as reading_router
 from .library_safety import router as library_safety_router
 from .evidence import router as evidence_router
 from .trash import router as trash_router
+from .annotations import router as annotations_router
 
 
 APP_DIR = Path(__file__).resolve().parent.parent
@@ -541,6 +542,7 @@ def create_app(data_dir=None, frontend_dist=None):
     application.include_router(library_safety_router)
     application.include_router(evidence_router)
     application.include_router(trash_router)
+    application.include_router(annotations_router)
 
     @application.get("/{path:path}", include_in_schema=False)
     def frontend(path: str):

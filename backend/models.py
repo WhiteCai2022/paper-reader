@@ -198,6 +198,51 @@ class Note(NoteCreate):
     id: str
 
 
+class AnnotationRect(Model):
+    x: Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)]
+    y: Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)]
+    width: Annotated[float, Field(gt=0, le=1, allow_inf_nan=False)]
+    height: Annotated[float, Field(gt=0, le=1, allow_inf_nan=False)]
+
+    @model_validator(mode="after")
+    def inside_page(self):
+        if self.x + self.width > 1.000001 or self.y + self.height > 1.000001:
+            raise ValueError("Annotation rectangle must be inside the PDF page")
+        return self
+
+
+class AnnotationText(Model):
+    content: Annotated[str, Field(min_length=1, max_length=20_000)]
+
+    @field_validator("content")
+    @classmethod
+    def nonblank_content(cls, value):
+        value = value.strip()
+        if not value:
+            raise ValueError("Annotation content cannot be blank")
+        return value
+
+
+class AnnotationCreate(AnnotationText):
+    page: Page
+    quote: Annotated[str, Field(min_length=1, max_length=10_000)]
+    rects: list[AnnotationRect] = Field(min_length=1, max_length=512)
+
+    @field_validator("quote")
+    @classmethod
+    def nonblank_quote(cls, value):
+        value = value.strip()
+        if not value:
+            raise ValueError("Selected text cannot be blank")
+        return value
+
+
+class Annotation(AnnotationCreate):
+    id: str
+    created_at: str
+    updated_at: str
+
+
 class ImportNote(NoteCreate):
     id: str | None = None
 
@@ -240,3 +285,4 @@ class Paper(Metadata):
 
 class PaperDetail(Paper):
     notes: list[Note]
+    annotations: list[Annotation] = Field(default_factory=list)

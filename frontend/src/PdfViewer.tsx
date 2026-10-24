@@ -1,11 +1,13 @@
 import { useEffect, useRef, useState } from 'react';
-import { FileWarning, LoaderCircle, RotateCw } from 'lucide-react';
+import { FileWarning, LoaderCircle, MessageSquare, MessageSquarePlus, RotateCw } from 'lucide-react';
 import { getDocument, GlobalWorkerOptions, TextLayer } from 'pdfjs-dist';
 import type { PDFDocumentProxy, RenderTask } from 'pdfjs-dist';
 import workerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import { messageOf } from './api';
 import { matchSourceRanges } from './pdfAlignment';
 import type { SourceHighlight } from './pdfAlignment';
+import { selectedPdfText } from './pdfSelection';
+import type { PdfAnnotation, TextAnchor } from './types';
 
 GlobalWorkerOptions.workerSrc = workerUrl;
 
@@ -16,11 +18,15 @@ interface Props {
   fitWidth: boolean;
   selectable: boolean;
   highlight?: SourceHighlight | null;
+  annotations: PdfAnnotation[];
+  activeAnnotationId: string | null;
+  onAnnotate: (anchor: TextAnchor) => void;
+  onSelectAnnotation: (annotation: PdfAnnotation) => void;
   onPageCount: (count: number) => void;
   onResolvedZoom: (zoom: number) => void;
 }
 
-export function PdfViewer({ url, page, zoom, fitWidth, selectable, highlight, onPageCount, onResolvedZoom }: Props) {
+export function PdfViewer({ url, page, zoom, fitWidth, selectable, highlight, annotations, activeAnnotationId, onAnnotate, onSelectAnnotation, onPageCount, onResolvedZoom }: Props) {
   const [document, setDocument] = useState<PDFDocumentProxy | null>(null);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(true);
@@ -30,6 +36,7 @@ export function PdfViewer({ url, page, zoom, fitWidth, selectable, highlight, on
   const [layerRevision, setLayerRevision] = useState(0);
   const [rectangles, setRectangles] = useState<{ left: number; top: number; width: number; height: number }[]>([]);
   const [unmatched, setUnmatched] = useState(false);
+  const [selection, setSelection] = useState<{ anchor: TextAnchor; left: number; top: number } | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const textRef = useRef<HTMLDivElement>(null);
@@ -145,7 +152,35 @@ export function PdfViewer({ url, page, zoom, fitWidth, selectable, highlight, on
 
   useEffect(() => { scrollRef.current?.scrollTo({ top: 0, left: 0 }); }, [page, url]);
 
-  return <div className="pdf-scroll" ref={scrollRef} aria-label={`PDF 第 ${page} 页`}>
+  useEffect(() => {
+    setSelection(null);
+    if (!selectable || rendering) return;
+    let timer: ReturnType<typeof setTimeout>;
+    const capture = () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => {
+        const layer = textRef.current, sheet = pageRef.current;
+        const anchor = layer && sheet ? selectedPdfText(layer, sheet, page) : null;
+        if (!anchor || !sheet) { setSelection(null); return; }
+        const bounds = sheet.getBoundingClientRect(), last = anchor.rects[anchor.rects.length - 1];
+        setSelection({ anchor, left: Math.max(8, Math.min(window.innerWidth - 110, bounds.left + last.x * bounds.width)),
+          top: Math.max(8, Math.min(window.innerHeight - 48, bounds.top + (last.y + last.height) * bounds.height + 6)) });
+      }, 160);
+    };
+    const escape = (event: KeyboardEvent) => { if (event.key === 'Escape') { clearTimeout(timer); setSelection(null); } };
+    window.document.addEventListener('selectionchange', capture);
+    window.document.addEventListener('keydown', escape);
+    return () => { clearTimeout(timer); window.document.removeEventListener('selectionchange', capture); window.document.removeEventListener('keydown', escape); };
+  }, [selectable, rendering, page, url, zoom, layerRevision]);
+
+  useEffect(() => {
+    const item = annotations.find(value => value.id === activeAnnotationId && value.page === page);
+    if (!item || !pageRef.current || !scrollRef.current) return;
+    const target = pageRef.current.offsetTop + item.rects[0].y * pageRef.current.clientHeight;
+    scrollRef.current.scrollTo({ top: Math.max(0, target - 80), behavior: 'auto' });
+  }, [activeAnnotationId, annotations, page, layerRevision]);
+
+  return <div className="pdf-scroll" ref={scrollRef} aria-label={`PDF 第 ${page} 页`} onScroll={() => setSelection(null)}>
     {loading && <div className="surface-state"><LoaderCircle className="spin" size={26} /><span>正在载入原文</span></div>}
     {error && <div className="pdf-error"><FileWarning size={25} /><strong>原文载入失败</strong><p>{error}</p>
       <button className="button" onClick={() => setRetry((value) => value + 1)}><RotateCw size={15} />重试</button></div>}
@@ -155,9 +190,16 @@ export function PdfViewer({ url, page, zoom, fitWidth, selectable, highlight, on
       <div className={`pdf-source-highlights ${highlight?.wholePage && highlight.page === page ? 'whole-page-reference' : ''}`} aria-hidden="true">
         {rectangles.map((rect, index) => <span key={index} style={rect} />)}
       </div>
+      {!rendering && <div className="pdf-annotation-highlights">
+        {annotations.filter(item => item.page === page).map(item => <div className={activeAnnotationId === item.id ? 'active' : ''} key={item.id}>
+          {item.rects.map((rect, index) => <span aria-hidden="true" key={index} style={{ left: `${rect.x * 100}%`, top: `${rect.y * 100}%`, width: `${rect.width * 100}%`, height: `${rect.height * 100}%` }} />)}
+          <button className="pdf-annotation-marker" style={{ top: `min(calc(100% - 28px), ${item.rects[0].y * 100}%)` }} title={item.content.slice(0, 200)} aria-label={`查看第 ${item.page} 页批注：${item.content.slice(0, 60)}`} onClick={() => onSelectAnnotation(item)}><MessageSquare size={14} /></button>
+        </div>)}
+      </div>}
       {unmatched && <div className="pdf-alignment-status" role="status">此段原文暂无法精确定位</div>}
       {rendering && <div className="page-loading"><LoaderCircle className="spin" size={22} /></div>}
     </div>}
+    {selection && <button className="button pdf-selection-action" style={{ left: selection.left, top: selection.top }} title="添加批注" aria-label="添加批注" onPointerDown={event => event.preventDefault()} onClick={() => { onAnnotate(selection.anchor); setSelection(null); window.getSelection()?.removeAllRanges(); }}><MessageSquarePlus size={16} />批注</button>}
     {!loading && document && <div className="page-caption">{page} / {document.numPages}</div>}
   </div>;
 }

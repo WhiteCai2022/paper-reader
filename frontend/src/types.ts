@@ -14,6 +14,9 @@ export interface Note {
   verification_status: VerificationStatus;
 }
 export type NoteInput = Omit<Note, 'id'>;
+export interface AnnotationRect { x: number; y: number; width: number; height: number }
+export interface TextAnchor { page: number; quote: string; rects: AnnotationRect[] }
+export interface PdfAnnotation extends TextAnchor { id: string; content: string; created_at: string; updated_at: string }
 export interface ReadingProgress { page: number; zoom: number; active_note_id: string | null }
 export interface Paper {
   id: string;
@@ -31,6 +34,7 @@ export interface Paper {
   status: 'unread' | 'reading' | 'done';
   progress: ReadingProgress;
   notes?: Note[];
+  annotations?: PdfAnnotation[];
   category_ids: string[];
 }
 export interface Category { id: string; name: string; paper_count: number; is_default: boolean }
